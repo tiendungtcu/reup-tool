@@ -5,22 +5,66 @@ import platform
 import uuid
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set, Tuple
 import subprocess
 import threading
 import time
 from functools import lru_cache
 
+from autobot import ALL_CONFIGS, channel_events, event_lock, is_rendered, upload_to_tiktok
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QLineEdit, QTextEdit, QComboBox, QSpinBox, QCheckBox, QPushButton,
+    QFormLayout, QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton,
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QGroupBox, QScrollArea, QProgressBar, QStatusBar, QMenuBar, QMenu,
     QDialog, QDialogButtonBox, QGridLayout, QFrame, QListWidget, QListWidgetItem,
-    QSizePolicy, QToolButton, QButtonGroup
+    QSizePolicy, QToolButton, QButtonGroup, QRadioButton
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
 from PySide6.QtGui import QIcon, QFont, QPixmap, QAction
+
+try:
+    from PIL import Image, ImageFilter
+except ImportError:
+    Image = None
+    ImageFilter = None
+
+import numpy as np
+
+from moviepy.editor import (
+    VideoFileClip,
+    AudioFileClip,
+    ImageClip,
+    ColorClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+)
+import moviepy.video.fx.all as vfx
+import moviepy.audio.fx.all as afx
+
+
+def _patch_pillow_resampling() -> None:
+    if Image is None:
+        return
+
+    resampling = getattr(Image, "Resampling", None)
+    if resampling is None:
+        return
+
+    replacements = {
+        "ANTIALIAS": "LANCZOS",
+        "LANCZOS": "LANCZOS",
+        "BICUBIC": "BICUBIC",
+        "BILINEAR": "BILINEAR",
+    }
+
+    for legacy_name, modern_name in replacements.items():
+        if not hasattr(Image, legacy_name) and hasattr(resampling, modern_name):
+            setattr(Image, legacy_name, getattr(resampling, modern_name))
+
+
+_patch_pillow_resampling()
 
 # Import additional GUI components
 try:
@@ -29,6 +73,10 @@ except ImportError:
     # Fallback if imports fail
     ChannelsTab = None
     ChannelDialog = None
+
+
+class WorkerCancelled(Exception):
+    """Raised when a worker thread is asked to stop early."""
 @lru_cache(maxsize=1)
 def get_machine_key(length: int = 16) -> str:
     """Generate a deterministic hardware-based key for the current machine."""
@@ -465,6 +513,8 @@ class YTDLPWorker(QThread):
         self.mode = mode
         self.format_id = format_id
         self.output_dir = output_dir
+        self._last_downloaded_path = None
+        self._cancel_event = threading.Event()
 
     def run(self) -> None:
         try:
@@ -475,6 +525,8 @@ class YTDLPWorker(QThread):
             return
 
         try:
+            self._check_cancelled()
+
             if self.mode == "fetch":
                 ydl_opts = {
                     "quiet": True,
@@ -484,6 +536,7 @@ class YTDLPWorker(QThread):
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(self.url, download=False)
+                self._check_cancelled()
                 formats = info.get("formats", [])
                 self.formats_ready.emit(formats, info)
                 self.completed.emit(True, info.get("title", ""))
@@ -509,11 +562,14 @@ class YTDLPWorker(QThread):
                 self.completed.emit(True, "Download completed")
             else:
                 raise ValueError(f"Unknown worker mode: {self.mode}")
+        except WorkerCancelled:
+            self.completed.emit(False, "Operation cancelled")
         except Exception as exc:
             self.error.emit(str(exc))
             self.completed.emit(False, str(exc))
 
     def _progress_hook(self, status: Dict[str, Any]) -> None:
+        self._check_cancelled()
         state = status.get("status")
         if state == "downloading":
             total = status.get("total_bytes") or status.get("total_bytes_estimate")
@@ -529,22 +585,423 @@ class YTDLPWorker(QThread):
             message = " | ".join(message_parts) if message_parts else "Downloading..."
             self.progress.emit(percent, message)
         elif state == "finished":
+            filename = (
+                status.get("filename")
+                or status.get("info_dict", {}).get("filepath")
+                or status.get("info_dict", {}).get("_filename")
+            )
+            if filename:
+                self._last_downloaded_path = filename
             self.progress.emit(1.0, "Processing...")
+
+    @property
+    def last_downloaded_path(self) -> Optional[str]:
+        return self._last_downloaded_path
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        self.requestInterruption()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event.is_set() or self.isInterruptionRequested():
+            raise WorkerCancelled()
+
+
+class VideoEditingWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(bool, str, str)
+
+    def __init__(self, input_path: str, output_dir: Path, options: Dict[str, Any]):
+        super().__init__()
+        self.input_path = Path(input_path)
+        self.output_dir = Path(output_dir)
+        self.options = options or {}
+        self._cancel_event = threading.Event()
+
+    def run(self) -> None:
+        output_path = ""
+        other_clip = None
+        audio_resources: List[Any] = []
+        clips_to_close: List[Any] = []
+        cleanup_ids: Set[int] = set()
+
+        def register_clip(clip_obj: Any) -> None:
+            if clip_obj is None or not hasattr(clip_obj, "close"):
+                return
+            obj_id = id(clip_obj)
+            if obj_id not in cleanup_ids:
+                cleanup_ids.add(obj_id)
+                clips_to_close.append(clip_obj)
+
+        try:
+            self._ensure_running()
+            if not self.input_path.exists():
+                raise FileNotFoundError(f"Input video not found: {self.input_path}")
+
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.progress.emit("Loading video...")
+            result_clip = VideoFileClip(str(self.input_path))
+            register_clip(result_clip)
+            self._ensure_running()
+
+            # Add center line
+            if self.options.get("add_line"):
+                thickness = max(1, int(self.options.get("line_thickness", 4)))
+                color = tuple(self.options.get("line_color", (255, 255, 255)))
+                self.progress.emit("Adding center line...")
+                self._ensure_running()
+                line_clip = ColorClip(size=(result_clip.w, thickness), color=color)
+                line_clip = line_clip.set_duration(result_clip.duration)
+                line_clip = line_clip.set_position(("center", "center"))
+                register_clip(line_clip)
+                result_clip = CompositeVideoClip(
+                    [result_clip, line_clip], size=result_clip.size, use_bgclip=True
+                )
+                register_clip(result_clip)
+
+            # Blur
+            if self.options.get("blur") and self.options.get("blur_sigma", 0) > 0:
+                sigma = max(0.1, float(self.options.get("blur_sigma", 5.0)))
+                self.progress.emit("Applying blur...")
+                self._ensure_running()
+                result_clip = self._apply_gaussian_blur(result_clip, sigma)
+                register_clip(result_clip)
+
+            # Overlay image
+            if self.options.get("overlay") and self.options.get("overlay_path"):
+                overlay_path = Path(str(self.options.get("overlay_path")))
+                if not overlay_path.exists():
+                    raise FileNotFoundError(f"Overlay image not found: {overlay_path}")
+                self.progress.emit("Adding overlay image...")
+                self._ensure_running()
+                overlay_clip = ImageClip(str(overlay_path)).set_duration(result_clip.duration)
+                register_clip(overlay_clip)
+                scale_factor = min(
+                    result_clip.w / overlay_clip.w if overlay_clip.w else 1.0,
+                    result_clip.h / overlay_clip.h if overlay_clip.h else 1.0,
+                    1.0,
+                )
+                if scale_factor < 1.0:
+                    overlay_clip = overlay_clip.resize(scale_factor)
+                    register_clip(overlay_clip)
+                overlay_clip = overlay_clip.set_position(("center", "center"))
+                result_clip = CompositeVideoClip(
+                    [result_clip, overlay_clip], size=result_clip.size, use_bgclip=True
+                )
+                register_clip(result_clip)
+
+            # Interleave with another video
+            if self.options.get("interleave") and self.options.get("interleave_path"):
+                interleave_path = Path(str(self.options.get("interleave_path")))
+                if not interleave_path.exists():
+                    raise FileNotFoundError(f"Interleave video not found: {interleave_path}")
+                self.progress.emit("Interleaving videos...")
+                self._ensure_running()
+                other_clip = VideoFileClip(str(interleave_path))
+                register_clip(other_clip)
+                other_clip = other_clip.resize(result_clip.size)
+                register_clip(other_clip)
+
+                primary_duration = result_clip.duration
+                secondary_duration = other_clip.duration
+                segment_length = max(0.5, float(self.options.get("interleave_segment", 1.0)))
+                segments: List[Any] = []
+                segments_ids: Set[int] = set()
+
+                def add_segment(segment_clip: Any) -> None:
+                    if segment_clip is None:
+                        return
+                    seg_id = id(segment_clip)
+                    if seg_id not in segments_ids:
+                        segments_ids.add(seg_id)
+                        segments.append(segment_clip)
+                        register_clip(segment_clip)
+
+                t_primary = 0.0
+                t_secondary = 0.0
+                use_primary = True
+
+                while t_primary < primary_duration or t_secondary < secondary_duration:
+                    self._ensure_running()
+                    if use_primary and t_primary < primary_duration:
+                        start = t_primary
+                        end = min(start + segment_length, primary_duration)
+                        add_segment(result_clip.subclip(start, end))
+                        t_primary = end
+                        use_primary = False
+                    elif not use_primary and t_secondary < secondary_duration:
+                        start = t_secondary
+                        end = min(start + segment_length, secondary_duration)
+                        add_segment(other_clip.subclip(start, end))
+                        t_secondary = end
+                        use_primary = True
+                    else:
+                        # Switch to whichever clip still has content
+                        use_primary = not use_primary
+
+                if not segments:
+                    raise RuntimeError("Interleave operation produced no segments")
+
+                result_clip = concatenate_videoclips(segments, method="compose")
+                register_clip(result_clip)
+
+            # Mute original audio
+            if self.options.get("mute"):
+                self.progress.emit("Muting original audio...")
+                self._ensure_running()
+                result_clip = result_clip.without_audio()
+                register_clip(result_clip)
+
+            # Replace audio
+            if self.options.get("add_audio") and self.options.get("audio_path"):
+                audio_path = Path(str(self.options.get("audio_path")))
+                if not audio_path.exists():
+                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
+                self.progress.emit("Adding custom audio...")
+                self._ensure_running()
+                base_audio = AudioFileClip(str(audio_path))
+                audio_resources.append(base_audio)
+
+                if base_audio.duration < result_clip.duration:
+                    final_audio = afx.audio_loop(base_audio, duration=result_clip.duration)
+                    audio_resources.append(final_audio)
+                else:
+                    final_audio = base_audio.subclip(0, result_clip.duration)
+                    audio_resources.append(final_audio)
+
+                result_clip = result_clip.set_audio(final_audio)
+                register_clip(result_clip)
+
+            # Rotate
+            if self.options.get("rotate"):
+                angle = float(self.options.get("rotate_degrees", 0.0))
+                if angle % 360:
+                    self.progress.emit("Rotating video...")
+                    self._ensure_running()
+                    result_clip = result_clip.rotate(angle)
+                    register_clip(result_clip)
+
+            # Zoom in
+            if self.options.get("zoom_in"):
+                factor = float(self.options.get("zoom_in_factor", 1.0))
+                if factor > 1.0:
+                    self.progress.emit("Zooming in...")
+                    self._ensure_running()
+                    zoomed = result_clip.fx(vfx.resize, factor)
+                    register_clip(zoomed)
+                    w, h = result_clip.size
+                    x1 = max(0, int(round((zoomed.w - w) / 2)))
+                    y1 = max(0, int(round((zoomed.h - h) / 2)))
+                    x2 = x1 + w
+                    y2 = y1 + h
+                    zoomed = vfx.crop(zoomed, x1=x1, y1=y1, x2=x2, y2=y2)
+                    register_clip(zoomed)
+                    result_clip = zoomed
+
+            # Zoom out
+            if self.options.get("zoom_out"):
+                factor = float(self.options.get("zoom_out_factor", 1.0))
+                if 0 < factor < 1.0:
+                    self.progress.emit("Zooming out...")
+                    self._ensure_running()
+                    scaled = result_clip.fx(vfx.resize, factor)
+                    register_clip(scaled)
+                    background = ColorClip(size=result_clip.size, color=(0, 0, 0))
+                    background = background.set_duration(result_clip.duration)
+                    register_clip(background)
+                    composite = CompositeVideoClip(
+                        [background, scaled.set_position(("center", "center"))],
+                        size=result_clip.size,
+                        use_bgclip=True,
+                    )
+                    if result_clip.audio:
+                        composite = composite.set_audio(result_clip.audio)
+                    register_clip(composite)
+                    result_clip = composite
+
+            suffix = self.input_path.suffix or ".mp4"
+            base_name = f"{self.input_path.stem}_edited{suffix}"
+            output_path = self.output_dir / base_name
+            counter = 1
+            while output_path.exists():
+                output_path = self.output_dir / f"{self.input_path.stem}_edited_{counter}{suffix}"
+                counter += 1
+
+            self.progress.emit("Rendering edited video...")
+            self._ensure_running()
+            temp_audio = self.output_dir / f"{self.input_path.stem}_temp_audio.m4a"
+            result_clip.write_videofile(
+                str(output_path),
+                codec="libx264",
+                audio_codec="aac",
+                temp_audiofile=str(temp_audio),
+                remove_temp=True,
+                threads=4,
+                logger=None,
+                verbose=False,
+            )
+
+            self.progress.emit("Finished video editing")
+            self.finished.emit(True, "Video edits applied successfully.", str(output_path))
+        except Exception as exc:
+            self.finished.emit(False, str(exc), "")
+        finally:
+            for resource in audio_resources:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+            if other_clip is not None:
+                try:
+                    other_clip.close()
+                except Exception:
+                    pass
+            for clip_obj in reversed(clips_to_close):
+                try:
+                    clip_obj.close()
+                except Exception:
+                    pass
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        self.requestInterruption()
+
+    def _ensure_running(self) -> None:
+        if self._cancel_event.is_set() or self.isInterruptionRequested():
+            raise WorkerCancelled()
+
+    def _apply_gaussian_blur(self, clip: VideoFileClip, sigma: float) -> VideoFileClip:
+        if Image is None or ImageFilter is None:
+            raise RuntimeError("Pillow is required for blur effect.")
+
+        radius = max(0.1, float(sigma))
+
+        def blur_frame(frame: np.ndarray) -> np.ndarray:
+            pil_image = Image.fromarray(frame)
+            blurred = pil_image.filter(ImageFilter.GaussianBlur(radius=radius))
+            return np.array(blurred)
+
+        return clip.fl_image(blur_frame)
+
+
+class TikTokUploadWorker(QThread):
+    progress = Signal(str)
+    completed = Signal(bool, str)
+
+    def __init__(
+        self,
+        channel_id: str,
+        config: Dict[str, Any],
+        cookies: Any,
+        video_path: str,
+        video_title: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.channel_id = channel_id
+        self.config = config
+        self.cookies = cookies
+        self.video_path = str(video_path)
+        self.video_title = video_title or Path(video_path).stem
+        self._cancel_event = threading.Event()
+
+    def run(self) -> None:
+        previous_config = ALL_CONFIGS.get(self.channel_id)
+        previous_render = is_rendered.get(self.channel_id)
+        event_created = False
+        try:
+            self.progress.emit("Preparing TikTok upload...")
+            with event_lock:
+                upload_event = channel_events.get(self.channel_id)
+                if upload_event is None:
+                    upload_event = threading.Event()
+                    channel_events[self.channel_id] = upload_event
+                    event_created = True
+                upload_event.set()
+
+            ALL_CONFIGS[self.channel_id] = {
+                "config": self.config,
+                "cookies": self.cookies,
+            }
+            is_rendered[self.channel_id] = True
+
+            self.progress.emit("Uploading video to TikTok...")
+            success = bool(
+                upload_to_tiktok(
+                    self.channel_id,
+                    self.video_path,
+                    self.video_path,
+                    video_id=self.video_title,
+                    video_title=self.video_title,
+                )
+            )
+            message = "Upload completed successfully." if success else "Upload failed. Check logs for details."
+            self.completed.emit(success, message)
+        except Exception as exc:
+            self.completed.emit(False, str(exc))
+        finally:
+            if previous_config is not None:
+                ALL_CONFIGS[self.channel_id] = previous_config
+            else:
+                ALL_CONFIGS.pop(self.channel_id, None)
+
+            if previous_render is not None:
+                is_rendered[self.channel_id] = previous_render
+            else:
+                is_rendered.pop(self.channel_id, None)
+
+            if event_created:
+                channel_events.pop(self.channel_id, None)
 
 
 class UtilitiesTab(QWidget):
-    def __init__(self):
+    def __init__(self, config_manager: ConfigManager):
         super().__init__()
+        self.config_manager = config_manager
         self.current_url: Optional[str] = None
         self.current_formats: List[Dict[str, Any]] = []
         self.format_map: Dict[str, str] = {}
         self.active_worker: Optional[YTDLPWorker] = None
         self.active_mode: Optional[str] = None
+        self.edit_worker = None
+        self.last_download_path = None
+        self.last_output_dir = None
+        self.upload_worker: Optional[QThread] = None
+
+        # Upload UI references (initialized during UI setup)
+        self.use_channel_radio: Optional[QRadioButton] = None
+        self.use_custom_radio: Optional[QRadioButton] = None
+        self.upload_channel_combo: Optional[QComboBox] = None
+        self.refresh_channels_btn: Optional[QPushButton] = None
+        self.custom_cookie_edit: Optional[QTextEdit] = None
+        self.load_cookie_file_btn: Optional[QPushButton] = None
+        self.clear_cookie_btn: Optional[QPushButton] = None
+        self.use_last_video_radio: Optional[QRadioButton] = None
+        self.use_other_video_radio: Optional[QRadioButton] = None
+        self.last_video_path_label: Optional[QLabel] = None
+        self.custom_video_path_edit: Optional[QLineEdit] = None
+        self.custom_video_browse_btn: Optional[QPushButton] = None
+        self.upload_button: Optional[QPushButton] = None
+        self.upload_status_label: Optional[QLabel] = None
+        self.cookie_source_group: Optional[QButtonGroup] = None
+        self.video_source_group: Optional[QButtonGroup] = None
+        self.upload_channel_entries: List[Dict[str, Any]] = []
         self._setup_ui()
+        self.refresh_upload_channels(initial=True)
+        self._update_last_video_label()
+        self._update_cookie_widgets()
+        self._update_video_widgets()
 
     def _setup_ui(self) -> None:
-        layout = QVBoxLayout()
-        layout.setSpacing(12)
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(12)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(0, 0, 0, 0)
 
         form_layout = QFormLayout()
         form_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
@@ -553,6 +1010,18 @@ class UtilitiesTab(QWidget):
         self.url_edit.setPlaceholderText("https://www.youtube.com/watch?v=...")
         self.url_edit.setMinimumWidth(360)
         form_layout.addRow("Video URL or ID:", self.url_edit)
+
+        self.platform_combo = QComboBox()
+        self.platform_combo.addItems([
+            "Auto Detect (yt-dlp)",
+            "YouTube",
+            "TikTok",
+            "Instagram",
+            "Vimeo",
+            "Facebook Reel",
+        ])
+        self.platform_combo.currentTextChanged.connect(self.on_platform_changed)
+        form_layout.addRow("Platform:", self.platform_combo)
 
         fetch_layout = QHBoxLayout()
         self.fetch_btn = QPushButton("Fetch Formats")
@@ -579,7 +1048,7 @@ class UtilitiesTab(QWidget):
         folder_layout.addWidget(browse_btn)
         form_layout.addRow("Save Folder:", folder_layout)
 
-        layout.addLayout(form_layout)
+        content_layout.addLayout(form_layout)
 
         controls_layout = QHBoxLayout()
         self.download_btn = QPushButton("Download Video")
@@ -587,34 +1056,676 @@ class UtilitiesTab(QWidget):
         self.download_btn.clicked.connect(self.download_video)
         controls_layout.addWidget(self.download_btn)
         controls_layout.addStretch()
-        layout.addLayout(controls_layout)
+        content_layout.addLayout(controls_layout)
+
+        content_layout.addWidget(self._create_editing_group())
+        content_layout.addWidget(self._create_upload_group())
+        content_layout.addStretch()
+
+        scroll_area.setWidget(content_widget)
+        main_layout.addWidget(scroll_area)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.progress_bar)
 
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        main_layout.addWidget(self.status_label)
 
-        layout.addStretch()
-        self.setLayout(layout)
+        self.setLayout(main_layout)
+        self.on_platform_changed(self.platform_combo.currentText())
+
+    def _create_editing_group(self) -> QGroupBox:
+        group = QGroupBox("Video Editing Options")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+
+        row = 0
+
+        # Center line overlay
+        self.line_checkbox = QCheckBox("Add center guide line")
+        self.line_checkbox.setToolTip("Draw a horizontal line across the vertical midpoint of the video.")
+        self.line_thickness_spin = QSpinBox()
+        self.line_thickness_spin.setRange(1, 20)
+        self.line_thickness_spin.setValue(4)
+        self.line_thickness_spin.setEnabled(False)
+        self.line_checkbox.toggled.connect(self.line_thickness_spin.setEnabled)
+
+        line_controls = QWidget()
+        line_layout = QHBoxLayout(line_controls)
+        line_layout.setContentsMargins(0, 0, 0, 0)
+        line_layout.setSpacing(6)
+        line_layout.addWidget(QLabel("Thickness (px):"))
+        line_layout.addWidget(self.line_thickness_spin)
+        line_layout.addStretch()
+
+        grid.addWidget(self.line_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(line_controls, row, 1)
+        row += 1
+
+        # Blur
+        self.blur_checkbox = QCheckBox("Blur video")
+        self.blur_checkbox.setToolTip("Apply a Gaussian blur to soften the footage.")
+        self.blur_value_spin = QDoubleSpinBox()
+        self.blur_value_spin.setRange(0.5, 50.0)
+        self.blur_value_spin.setSingleStep(0.5)
+        self.blur_value_spin.setValue(5.0)
+        self.blur_value_spin.setEnabled(False)
+        self.blur_checkbox.toggled.connect(self.blur_value_spin.setEnabled)
+
+        blur_controls = QWidget()
+        blur_layout = QHBoxLayout(blur_controls)
+        blur_layout.setContentsMargins(0, 0, 0, 0)
+        blur_layout.setSpacing(6)
+        blur_layout.addWidget(QLabel("Sigma:"))
+        blur_layout.addWidget(self.blur_value_spin)
+        blur_layout.addStretch()
+
+        grid.addWidget(self.blur_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(blur_controls, row, 1)
+        row += 1
+
+        # Overlay image
+        self.overlay_checkbox = QCheckBox("Add overlay image")
+        self.overlay_checkbox.setToolTip("Place a static image on top of the entire video.")
+        self.overlay_path_edit = QLineEdit()
+        self.overlay_path_edit.setPlaceholderText("Select image file (PNG, JPG, BMP)")
+        self.overlay_path_edit.setEnabled(False)
+        self.overlay_browse_btn = QPushButton("Browse")
+        self.overlay_browse_btn.setEnabled(False)
+        self.overlay_browse_btn.clicked.connect(self.choose_overlay_image)
+        self.overlay_checkbox.toggled.connect(lambda checked: self._set_widgets_enabled([self.overlay_path_edit, self.overlay_browse_btn], checked))
+
+        overlay_controls = QWidget()
+        overlay_layout = QHBoxLayout(overlay_controls)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(6)
+        overlay_layout.addWidget(self.overlay_path_edit)
+        overlay_layout.addWidget(self.overlay_browse_btn)
+
+        grid.addWidget(self.overlay_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(overlay_controls, row, 1)
+        row += 1
+
+        # Interleave video
+        self.interleave_checkbox = QCheckBox("Interleave with another video")
+        self.interleave_checkbox.setToolTip("Alternate segments of this video with another clip.")
+        self.interleave_path_edit = QLineEdit()
+        self.interleave_path_edit.setPlaceholderText("Select secondary video file")
+        self.interleave_path_edit.setEnabled(False)
+        self.interleave_browse_btn = QPushButton("Browse")
+        self.interleave_browse_btn.setEnabled(False)
+        self.interleave_browse_btn.clicked.connect(self.choose_interleave_video)
+        self.interleave_segment_spin = QDoubleSpinBox()
+        self.interleave_segment_spin.setRange(0.5, 10.0)
+        self.interleave_segment_spin.setSingleStep(0.5)
+        self.interleave_segment_spin.setValue(1.0)
+        self.interleave_segment_spin.setSuffix(" s")
+        self.interleave_segment_spin.setEnabled(False)
+        self.interleave_checkbox.toggled.connect(lambda checked: self._set_widgets_enabled([
+            self.interleave_path_edit,
+            self.interleave_browse_btn,
+            self.interleave_segment_spin,
+        ], checked))
+
+        interleave_controls = QWidget()
+        interleave_layout = QHBoxLayout(interleave_controls)
+        interleave_layout.setContentsMargins(0, 0, 0, 0)
+        interleave_layout.setSpacing(6)
+        interleave_layout.addWidget(self.interleave_path_edit)
+        interleave_layout.addWidget(self.interleave_browse_btn)
+        interleave_layout.addWidget(QLabel("Segment:"))
+        interleave_layout.addWidget(self.interleave_segment_spin)
+
+        grid.addWidget(self.interleave_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(interleave_controls, row, 1)
+        row += 1
+
+        # Mute audio
+        self.mute_checkbox = QCheckBox("Mute original audio")
+        self.mute_checkbox.setToolTip("Remove the original audio track from the video.")
+        grid.addWidget(self.mute_checkbox, row, 0, alignment=Qt.AlignLeft)
+        row += 1
+
+        # Replace audio
+        self.audio_checkbox = QCheckBox("Add custom audio track")
+        self.audio_checkbox.setToolTip("Replace the audio with a specific sound file (loops if shorter).")
+        self.audio_path_edit = QLineEdit()
+        self.audio_path_edit.setPlaceholderText("Select audio file (MP3, WAV, AAC)")
+        self.audio_path_edit.setEnabled(False)
+        self.audio_browse_btn = QPushButton("Browse")
+        self.audio_browse_btn.setEnabled(False)
+        self.audio_browse_btn.clicked.connect(self.choose_audio_file)
+        self.audio_checkbox.toggled.connect(lambda checked: self._set_widgets_enabled([self.audio_path_edit, self.audio_browse_btn], checked))
+
+        audio_controls = QWidget()
+        audio_layout = QHBoxLayout(audio_controls)
+        audio_layout.setContentsMargins(0, 0, 0, 0)
+        audio_layout.setSpacing(6)
+        audio_layout.addWidget(self.audio_path_edit)
+        audio_layout.addWidget(self.audio_browse_btn)
+
+        grid.addWidget(self.audio_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(audio_controls, row, 1)
+        row += 1
+
+        # Rotate
+        self.rotate_checkbox = QCheckBox("Rotate video")
+        self.rotate_checkbox.setToolTip("Rotate the video clockwise (positive) or counter-clockwise (negative).")
+        self.rotate_spin = QDoubleSpinBox()
+        self.rotate_spin.setRange(-180.0, 180.0)
+        self.rotate_spin.setSingleStep(5.0)
+        self.rotate_spin.setSuffix(" °")
+        self.rotate_spin.setValue(0.0)
+        self.rotate_spin.setEnabled(False)
+        self.rotate_checkbox.toggled.connect(self.rotate_spin.setEnabled)
+
+        rotate_controls = QWidget()
+        rotate_layout = QHBoxLayout(rotate_controls)
+        rotate_layout.setContentsMargins(0, 0, 0, 0)
+        rotate_layout.setSpacing(6)
+        rotate_layout.addWidget(QLabel("Degrees:"))
+        rotate_layout.addWidget(self.rotate_spin)
+        rotate_layout.addStretch()
+
+        grid.addWidget(self.rotate_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(rotate_controls, row, 1)
+        row += 1
+
+        # Zoom in
+        self.zoom_in_checkbox = QCheckBox("Zoom in")
+        self.zoom_in_checkbox.setToolTip("Zoom into the center of the frame by the specified factor.")
+        self.zoom_in_spin = QDoubleSpinBox()
+        self.zoom_in_spin.setRange(1.1, 4.0)
+        self.zoom_in_spin.setSingleStep(0.1)
+        self.zoom_in_spin.setValue(1.2)
+        self.zoom_in_spin.setEnabled(False)
+        self.zoom_in_checkbox.toggled.connect(self._on_zoom_in_toggled)
+
+        zoom_in_controls = QWidget()
+        zoom_in_layout = QHBoxLayout(zoom_in_controls)
+        zoom_in_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_in_layout.setSpacing(6)
+        zoom_in_layout.addWidget(QLabel("Factor:"))
+        zoom_in_layout.addWidget(self.zoom_in_spin)
+        zoom_in_layout.addStretch()
+
+        grid.addWidget(self.zoom_in_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(zoom_in_controls, row, 1)
+        row += 1
+
+        # Zoom out
+        self.zoom_out_checkbox = QCheckBox("Zoom out")
+        self.zoom_out_checkbox.setToolTip("Scale the video down and letterbox it inside the frame.")
+        self.zoom_out_spin = QDoubleSpinBox()
+        self.zoom_out_spin.setRange(0.2, 0.99)
+        self.zoom_out_spin.setSingleStep(0.05)
+        self.zoom_out_spin.setValue(0.8)
+        self.zoom_out_spin.setEnabled(False)
+        self.zoom_out_checkbox.toggled.connect(self._on_zoom_out_toggled)
+
+        zoom_out_controls = QWidget()
+        zoom_out_layout = QHBoxLayout(zoom_out_controls)
+        zoom_out_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_out_layout.setSpacing(6)
+        zoom_out_layout.addWidget(QLabel("Factor:"))
+        zoom_out_layout.addWidget(self.zoom_out_spin)
+        zoom_out_layout.addStretch()
+
+        grid.addWidget(self.zoom_out_checkbox, row, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(zoom_out_controls, row, 1)
+
+        group.setLayout(grid)
+        return group
+
+    def _create_upload_group(self) -> QGroupBox:
+        group = QGroupBox("Upload Options")
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+
+        description = QLabel(
+            "Upload the downloaded or edited video to a TikTok account using saved cookies "
+            "or custom cookies."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.cookie_source_group = QButtonGroup(self)
+        self.cookie_source_group.setExclusive(True)
+
+        self.use_channel_radio = QRadioButton("Use cookies from configured channel")
+        self.use_custom_radio = QRadioButton("Use custom cookies JSON")
+        self.use_channel_radio.setChecked(True)
+
+        self.cookie_source_group.addButton(self.use_channel_radio)
+        self.cookie_source_group.addButton(self.use_custom_radio)
+
+        self.use_channel_radio.toggled.connect(self._update_cookie_widgets)
+        self.use_custom_radio.toggled.connect(self._update_cookie_widgets)
+
+        layout.addWidget(self.use_channel_radio)
+
+        channel_row = QHBoxLayout()
+        self.upload_channel_combo = QComboBox()
+        self.upload_channel_combo.setPlaceholderText("Select channel with TikTok cookies")
+        self.upload_channel_combo.currentIndexChanged.connect(self._on_channel_selection_changed)
+        channel_row.addWidget(self.upload_channel_combo, 1)
+
+        self.refresh_channels_btn = QPushButton("Refresh")
+        self.refresh_channels_btn.clicked.connect(self.refresh_upload_channels)
+        channel_row.addWidget(self.refresh_channels_btn)
+        layout.addLayout(channel_row)
+
+        layout.addWidget(self.use_custom_radio)
+
+        custom_cookie_buttons = QHBoxLayout()
+        self.load_cookie_file_btn = QPushButton("Load cookies from file")
+        self.load_cookie_file_btn.clicked.connect(self.load_custom_cookies_from_file)
+        custom_cookie_buttons.addWidget(self.load_cookie_file_btn)
+
+        self.clear_cookie_btn = QPushButton("Clear")
+        self.clear_cookie_btn.clicked.connect(self.clear_custom_cookies)
+        custom_cookie_buttons.addWidget(self.clear_cookie_btn)
+        custom_cookie_buttons.addStretch()
+        layout.addLayout(custom_cookie_buttons)
+
+        self.custom_cookie_edit = QTextEdit()
+        self.custom_cookie_edit.setPlaceholderText('Paste cookies JSON (e.g., {"cookies": [...]})')
+        self.custom_cookie_edit.setMinimumHeight(100)
+        self.custom_cookie_edit.textChanged.connect(self._on_custom_cookies_changed)
+        layout.addWidget(self.custom_cookie_edit)
+
+        layout.addSpacing(4)
+        video_label = QLabel("Select the video to upload")
+        video_label.setWordWrap(True)
+        layout.addWidget(video_label)
+
+        self.video_source_group = QButtonGroup(self)
+        self.video_source_group.setExclusive(True)
+
+        self.use_last_video_radio = QRadioButton("Use last downloaded/edited video")
+        self.use_last_video_radio.setChecked(True)
+        self.use_last_video_radio.toggled.connect(self._update_video_widgets)
+        self.video_source_group.addButton(self.use_last_video_radio)
+        layout.addWidget(self.use_last_video_radio)
+
+        self.last_video_path_label = QLabel("No video available yet.")
+        self.last_video_path_label.setWordWrap(True)
+        layout.addWidget(self.last_video_path_label)
+
+        self.use_other_video_radio = QRadioButton("Select another video file")
+        self.use_other_video_radio.toggled.connect(self._update_video_widgets)
+        self.video_source_group.addButton(self.use_other_video_radio)
+        layout.addWidget(self.use_other_video_radio)
+
+        custom_video_row = QHBoxLayout()
+        self.custom_video_path_edit = QLineEdit()
+        self.custom_video_path_edit.setPlaceholderText("Choose a video file to upload")
+        custom_video_row.addWidget(self.custom_video_path_edit, 1)
+
+        self.custom_video_browse_btn = QPushButton("Browse")
+        self.custom_video_browse_btn.clicked.connect(self._browse_custom_video)
+        custom_video_row.addWidget(self.custom_video_browse_btn)
+        layout.addLayout(custom_video_row)
+
+        controls_layout = QHBoxLayout()
+        self.upload_button = QPushButton("Upload to TikTok")
+        self.upload_button.setEnabled(False)
+        self.upload_button.clicked.connect(self.start_upload)
+        controls_layout.addWidget(self.upload_button)
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+
+        self.upload_status_label = QLabel("")
+        self.upload_status_label.setWordWrap(True)
+        layout.addWidget(self.upload_status_label)
+
+        group.setLayout(layout)
+        return group
+
+    def _update_cookie_widgets(self) -> None:
+        use_channel = bool(self.use_channel_radio and self.use_channel_radio.isChecked())
+        use_custom = bool(self.use_custom_radio and self.use_custom_radio.isChecked())
+
+        if self.upload_channel_combo:
+            self.upload_channel_combo.setEnabled(use_channel)
+        if self.refresh_channels_btn:
+            self.refresh_channels_btn.setEnabled(use_channel)
+
+        for widget in (self.custom_cookie_edit, self.load_cookie_file_btn, self.clear_cookie_btn):
+            if widget:
+                widget.setEnabled(use_custom)
+
+        self._update_upload_button_state()
+
+    def _update_video_widgets(self) -> None:
+        use_custom = bool(self.use_other_video_radio and self.use_other_video_radio.isChecked())
+
+        for widget in (self.custom_video_path_edit, self.custom_video_browse_btn):
+            if widget:
+                widget.setEnabled(use_custom)
+
+        self._update_last_video_label()
+        self._update_upload_button_state()
+
+    def _on_channel_selection_changed(self, index: int) -> None:
+        entry = self._selected_channel_entry()
+        if self.upload_status_label and self.use_channel_radio and self.use_channel_radio.isChecked():
+            if not entry:
+                self.upload_status_label.setText("")
+            elif not entry.get("has_cookies"):
+                self.upload_status_label.setText("Selected channel has no cookies configured.")
+            else:
+                self.upload_status_label.setText("")
+
+        self._update_upload_button_state()
+
+    def _selected_channel_entry(self) -> Optional[Dict[str, Any]]:
+        if not self.upload_channel_combo:
+            return None
+
+        data = self.upload_channel_combo.itemData(self.upload_channel_combo.currentIndex())
+        return data if isinstance(data, dict) else None
+
+    def refresh_upload_channels(self, initial: bool = False) -> None:
+        if not self.upload_channel_combo:
+            return
+
+        try:
+            channels = self.config_manager.get_channels()
+        except Exception as exc:
+            if not initial:
+                QMessageBox.critical(self, "Failed to load channels", str(exc))
+            return
+
+        entries: List[Dict[str, Any]] = []
+        for channel_id, data in sorted(channels.items(), key=lambda item: item[0]):
+            config = data.get("config", {})
+            cookies = data.get("cookies")
+            has_cookies = bool(cookies)
+            name = config.get("channel_name") or channel_id
+            label = name if name else channel_id
+            if name and name != channel_id:
+                label = f"{name} ({channel_id})"
+            if not has_cookies:
+                label = f"{label} – missing cookies"
+            entries.append({
+                "id": channel_id,
+                "label": label,
+                "has_cookies": has_cookies,
+                "config": config,
+                "cookies": cookies,
+            })
+
+        self.upload_channel_entries = entries
+
+        combo = self.upload_channel_combo
+        current_entry = self._selected_channel_entry()
+        current_id = current_entry.get("id") if current_entry else None
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Select channel", None)
+
+        restore_index = 0
+        for idx, entry in enumerate(entries, start=1):
+            combo.addItem(entry["label"], entry)
+            if entry["id"] == current_id:
+                restore_index = idx
+
+        combo.setCurrentIndex(restore_index)
+        combo.blockSignals(False)
+
+        if not entries and not initial and self.upload_status_label:
+            self.upload_status_label.setText(
+                "No channels available. Configure TikTok cookies in the Channels tab or use custom cookies."
+            )
+
+        self._on_channel_selection_changed(combo.currentIndex())
+        self._update_cookie_widgets()
+
+    def load_custom_cookies_from_file(self) -> None:
+        if not self.custom_cookie_edit:
+            return
+
+        start_dir = str(Path(self.folder_edit.text()).expanduser()) if hasattr(self, "folder_edit") else ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select cookies JSON file",
+            start_dir,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            self.custom_cookie_edit.setPlainText(content)
+            if self.use_custom_radio and not self.use_custom_radio.isChecked():
+                self.use_custom_radio.setChecked(True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Cookies Failed", f"Could not load cookies:\n{exc}")
+
+    def clear_custom_cookies(self) -> None:
+        if self.custom_cookie_edit:
+            self.custom_cookie_edit.clear()
+        self._update_upload_button_state()
+
+    def _on_custom_cookies_changed(self) -> None:
+        self._update_upload_button_state()
+
+    def _browse_custom_video(self) -> None:
+        start_dir = (
+            str((self.last_output_dir or Path(self.folder_edit.text()).expanduser()))
+            if hasattr(self, "folder_edit")
+            else ""
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select video file",
+            start_dir,
+            "Video Files (*.mp4 *.mov *.mkv *.webm *.m4v *.avi);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        if self.custom_video_path_edit:
+            self.custom_video_path_edit.setText(file_path)
+        if self.use_other_video_radio and not self.use_other_video_radio.isChecked():
+            self.use_other_video_radio.setChecked(True)
+
+        self._update_upload_button_state()
+
+    def _update_last_video_label(self) -> None:
+        if not self.last_video_path_label:
+            return
+
+        if self.last_download_path and Path(self.last_download_path).exists():
+            display_name = Path(self.last_download_path).name
+            self.last_video_path_label.setText(f"Last video ready: {display_name}")
+        elif self.last_download_path:
+            display_name = Path(self.last_download_path).name
+            self.last_video_path_label.setText(f"Last video missing: {display_name}")
+        else:
+            self.last_video_path_label.setText("No video available yet.")
+
+        self._update_upload_button_state()
+
+    def _current_upload_video_path(self) -> Optional[str]:
+        if self.use_last_video_radio and self.use_last_video_radio.isChecked():
+            return self.last_download_path
+        if self.use_other_video_radio and self.use_other_video_radio.isChecked():
+            if self.custom_video_path_edit:
+                path = self.custom_video_path_edit.text().strip()
+                return path or None
+        return None
+
+    def _has_selected_video(self) -> bool:
+        video_path = self._current_upload_video_path()
+        return bool(video_path and Path(video_path).exists())
+
+    def _has_cookie_source(self) -> bool:
+        if self.use_channel_radio and self.use_channel_radio.isChecked():
+            entry = self._selected_channel_entry()
+            return bool(entry and entry.get("has_cookies"))
+        if self.use_custom_radio and self.use_custom_radio.isChecked():
+            return bool(self.custom_cookie_edit and self.custom_cookie_edit.toPlainText().strip())
+        return False
+
+    def _update_upload_button_state(self) -> None:
+        if not self.upload_button:
+            return
+
+        ready = self._has_cookie_source() and self._has_selected_video()
+        if self.upload_worker and self.upload_worker.isRunning():
+            ready = False
+
+        self.upload_button.setEnabled(ready)
+
+    def _parse_custom_cookies(self) -> Any:
+        if not self.custom_cookie_edit:
+            raise ValueError("Custom cookies editor unavailable.")
+
+        raw_text = self.custom_cookie_edit.toPlainText().strip()
+        if not raw_text:
+            raise ValueError("Paste custom cookies JSON or load from file before uploading.")
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid cookies JSON: {exc}")
+
+        if isinstance(data, (list, tuple)) and not data:
+            raise ValueError("Custom cookies JSON is empty.")
+        if isinstance(data, dict) and not data:
+            raise ValueError("Custom cookies JSON is empty.")
+
+        return data
+
+    def _derive_video_title(self, video_path: str) -> str:
+        if self.video_title_label:
+            label_text = self.video_title_label.text().strip()
+            if label_text:
+                return label_text
+        return Path(video_path).stem
+
+    def start_upload(self) -> None:
+        if self.upload_worker and self.upload_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Upload In Progress",
+                "Please wait for the current upload to finish before starting a new one.",
+            )
+            return
+
+        video_path = self._current_upload_video_path()
+        if not video_path:
+            QMessageBox.warning(self, "Video Selection", "Select a video to upload.")
+            return
+
+        video_file = Path(video_path)
+        if not video_file.exists():
+            QMessageBox.warning(self, "Video Missing", f"Selected video not found:\n{video_path}")
+            return
+
+        try:
+            if self.use_channel_radio and self.use_channel_radio.isChecked():
+                entry = self._selected_channel_entry()
+                if not entry:
+                    raise ValueError("Choose a channel with stored TikTok cookies.")
+                if not entry.get("has_cookies"):
+                    raise ValueError("Selected channel does not have cookies configured.")
+                channel_id = entry["id"]
+                base_config = dict(entry.get("config") or {})
+                config = self.config_manager._merge_channel_defaults(base_config)
+                cookies = entry.get("cookies") or {}
+            else:
+                cookies = self._parse_custom_cookies()
+                channel_id = "__gui_custom__"
+                config = self.config_manager._merge_channel_defaults(
+                    {
+                        "channel_name": "Custom TikTok Upload",
+                        "upload_method": "browser",
+                        "is_human": 0,
+                    }
+                )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Upload Configuration", str(exc))
+            return
+
+        video_title = self._derive_video_title(str(video_file))
+
+        self.upload_status_label.setText("Preparing upload...")
+
+        worker = TikTokUploadWorker(
+            channel_id=channel_id,
+            config=config,
+            cookies=cookies,
+            video_path=str(video_file),
+            video_title=video_title,
+        )
+        worker.setParent(self)
+        worker.progress.connect(self._on_upload_progress)
+        worker.completed.connect(self._on_upload_completed)
+        worker.finished.connect(worker.deleteLater)
+
+        self.upload_worker = worker
+        self._update_upload_button_state()
+        worker.start()
+
+    def _on_upload_progress(self, message: str) -> None:
+        if message and self.upload_status_label:
+            self.upload_status_label.setText(message)
+
+    def _on_upload_completed(self, success: bool, message: str) -> None:
+        self.upload_status_label.setText(message)
+        if not success:
+            QMessageBox.critical(self, "Upload Failed", message)
+        else:
+            QMessageBox.information(self, "Upload Complete", message)
+
+        self.upload_worker = None
+        self._update_upload_button_state()
+
+    def _set_widgets_enabled(self, widgets: List[QWidget], enabled: bool) -> None:
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def _on_zoom_in_toggled(self, checked: bool) -> None:
+        self.zoom_in_spin.setEnabled(checked)
+        if checked:
+            self.zoom_out_checkbox.blockSignals(True)
+            self.zoom_out_checkbox.setChecked(False)
+            self.zoom_out_checkbox.blockSignals(False)
+            self.zoom_out_spin.setEnabled(False)
+
+    def _on_zoom_out_toggled(self, checked: bool) -> None:
+        self.zoom_out_spin.setEnabled(checked)
+        if checked:
+            self.zoom_in_checkbox.blockSignals(True)
+            self.zoom_in_checkbox.setChecked(False)
+            self.zoom_in_checkbox.blockSignals(False)
+            self.zoom_in_spin.setEnabled(False)
 
     def fetch_formats(self) -> None:
         url = self.url_edit.text().strip()
         if not url:
-            QMessageBox.warning(self, "Missing URL", "Please enter a YouTube video URL or ID.")
+            QMessageBox.warning(self, "Missing URL", "Please enter a video URL or ID.")
             return
 
-        if "//" not in url:
-            url = f"https://www.youtube.com/watch?v={url}"
+        url = self._normalize_url(url)
 
         self._reset_state()
         self._set_working_state(True, mode="fetch")
         self.status_label.setText("Fetching available formats...")
 
         worker = YTDLPWorker(url=url, mode="fetch")
+        worker.setParent(self)
         worker.formats_ready.connect(self.on_formats_ready)
         worker.progress.connect(self.on_worker_progress)
         worker.completed.connect(lambda success, message: self.on_worker_completed("fetch", success, message))
@@ -626,18 +1737,40 @@ class UtilitiesTab(QWidget):
         self.current_url = url
 
     def download_video(self) -> None:
+        if self.edit_worker and self.edit_worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Editing In Progress",
+                "Please wait for the current video editing to finish before starting a new download.",
+            )
+            return
+
         if not self.current_url:
             QMessageBox.warning(self, "No Video", "Please fetch video formats first.")
             return
 
-        if not self.formats_combo.isEnabled() or self.formats_combo.currentIndex() < 0:
-            QMessageBox.warning(self, "No Format", "Please select a video format to download.")
-            return
+        manual_format_required = not self._platform_supports_format_selection()
 
-        format_label = self.formats_combo.currentText()
-        format_id = self.format_map.get(format_label)
+        if not self.formats_combo.isEnabled() or self.formats_combo.currentIndex() < 0:
+            if manual_format_required:
+                selected_label = self.formats_combo.currentText() or next(iter(self.format_map), None)
+            else:
+                QMessageBox.warning(self, "No Format", "Please select a video format to download.")
+                return
+        else:
+            selected_label = self.formats_combo.currentText()
+
+        if not selected_label:
+            selected_label = next(iter(self.format_map), "best")
+
+        format_label = selected_label
+        format_id = self.format_map.get(format_label, "best")
+
+        if manual_format_required:
+            self.status_label.setText("Using best available format for selected platform.")
+
         if not format_id:
-            QMessageBox.warning(self, "Invalid Format", "Could not determine the selected format.")
+            QMessageBox.warning(self, "No Format", "Please select a video format to download.")
             return
 
         output_dir = Path(self.folder_edit.text().strip() or ".").expanduser()
@@ -646,6 +1779,9 @@ class UtilitiesTab(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Folder Error", f"Failed to create output folder: {exc}")
             return
+
+        self.last_output_dir = output_dir
+        self.last_download_path = None
 
         self._set_working_state(True, mode="download")
         self.status_label.setText("Starting download...")
@@ -657,6 +1793,7 @@ class UtilitiesTab(QWidget):
             format_id=format_id,
             output_dir=str(output_dir),
         )
+        worker.setParent(self)
         worker.progress.connect(self.on_worker_progress)
         worker.completed.connect(lambda success, message: self.on_worker_completed("download", success, message))
         worker.error.connect(self.on_worker_error)
@@ -664,16 +1801,264 @@ class UtilitiesTab(QWidget):
         self.active_worker = worker
         self.active_mode = "download"
         worker.start()
+        self._update_last_video_label()
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.folder_edit.text())
         if folder:
             self.folder_edit.setText(folder)
 
+    def choose_overlay_image(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Overlay Image",
+            str(Path(self.folder_edit.text()).expanduser()),
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*)",
+        )
+        if file_path:
+            self.overlay_path_edit.setText(file_path)
+            if not self.overlay_checkbox.isChecked():
+                self.overlay_checkbox.setChecked(True)
+
+    def choose_interleave_video(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Secondary Video",
+            str(Path(self.folder_edit.text()).expanduser()),
+            "Video Files (*.mp4 *.mov *.mkv *.webm *.m4v *.avi);;All Files (*)",
+        )
+        if file_path:
+            self.interleave_path_edit.setText(file_path)
+            if not self.interleave_checkbox.isChecked():
+                self.interleave_checkbox.setChecked(True)
+
+    def choose_audio_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio File",
+            str(Path(self.folder_edit.text()).expanduser()),
+            "Audio Files (*.mp3 *.wav *.aac *.m4a *.ogg *.flac);;All Files (*)",
+        )
+        if file_path:
+            self.audio_path_edit.setText(file_path)
+            if not self.audio_checkbox.isChecked():
+                self.audio_checkbox.setChecked(True)
+
+    def _normalize_url(self, url: str) -> str:
+        if not url:
+            return url
+
+        platform = self.platform_combo.currentText()
+        if platform == "Auto Detect (yt-dlp)":
+            return url
+
+        if platform == "YouTube" and "//" not in url:
+            return f"https://www.youtube.com/watch?v={url}"
+        if platform == "TikTok" and "//" not in url:
+            return f"https://www.tiktok.com/@_/{url}"
+        if platform == "Instagram" and "//" not in url:
+            return f"https://www.instagram.com/reel/{url}/"
+        if platform == "Vimeo" and "//" not in url:
+            return f"https://vimeo.com/{url}"
+        if platform == "Facebook Reel" and "//" not in url:
+            return f"https://www.facebook.com/reel/{url}"
+
+        return url
+
+    def _platform_supports_format_selection(self) -> bool:
+        return self.platform_combo.currentText() in {
+            "Auto Detect (yt-dlp)",
+            "YouTube",
+            "Vimeo",
+        }
+
+    def _update_format_controls(self, has_formats: bool) -> None:
+        supports_selection = self._platform_supports_format_selection()
+        if supports_selection:
+            self.formats_combo.setEnabled(has_formats)
+            self.download_btn.setEnabled(has_formats)
+        else:
+            self.formats_combo.setEnabled(False)
+            self.download_btn.setEnabled(has_formats)
+
+    def on_platform_changed(self, platform: str) -> None:
+        placeholder_map = {
+            "Auto Detect (yt-dlp)": "Paste a supported video URL",
+            "YouTube": "https://www.youtube.com/watch?v=...",
+            "TikTok": "https://www.tiktok.com/@user/video/...",
+            "Instagram": "https://www.instagram.com/reel/...",
+            "Vimeo": "https://vimeo.com/...",
+            "Facebook Reel": "https://www.facebook.com/reel/...",
+        }
+        self.url_edit.setPlaceholderText(
+            placeholder_map.get(platform, "Paste a supported video URL")
+        )
+
+        if self.active_worker and self.active_worker.isRunning():
+            return
+
+        self._reset_state()
+
+    def _any_edit_selected(self) -> bool:
+        return any(
+            checkbox.isChecked()
+            for checkbox in [
+                self.line_checkbox,
+                self.blur_checkbox,
+                self.overlay_checkbox,
+                self.interleave_checkbox,
+                self.mute_checkbox,
+                self.audio_checkbox,
+                self.rotate_checkbox,
+                self.zoom_in_checkbox,
+                self.zoom_out_checkbox,
+            ]
+        )
+
+    def _gather_edit_options(self) -> Dict[str, Any]:
+        return {
+            "add_line": self.line_checkbox.isChecked(),
+            "line_thickness": self.line_thickness_spin.value(),
+            "line_color": (255, 255, 255),
+            "blur": self.blur_checkbox.isChecked(),
+            "blur_sigma": self.blur_value_spin.value(),
+            "overlay": self.overlay_checkbox.isChecked(),
+            "overlay_path": self.overlay_path_edit.text().strip(),
+            "interleave": self.interleave_checkbox.isChecked(),
+            "interleave_path": self.interleave_path_edit.text().strip(),
+            "interleave_segment": self.interleave_segment_spin.value(),
+            "mute": self.mute_checkbox.isChecked(),
+            "add_audio": self.audio_checkbox.isChecked(),
+            "audio_path": self.audio_path_edit.text().strip(),
+            "rotate": self.rotate_checkbox.isChecked(),
+            "rotate_degrees": self.rotate_spin.value(),
+            "zoom_in": self.zoom_in_checkbox.isChecked(),
+            "zoom_in_factor": self.zoom_in_spin.value(),
+            "zoom_out": self.zoom_out_checkbox.isChecked(),
+            "zoom_out_factor": self.zoom_out_spin.value(),
+        }
+
+    def _validate_edit_options(self, options: Dict[str, Any]) -> Optional[str]:
+        if options["add_line"] and options["line_thickness"] <= 0:
+            return "Line thickness must be greater than zero."
+
+        if options["blur"] and options["blur_sigma"] <= 0:
+            return "Blur intensity must be greater than zero."
+
+        if options["overlay"]:
+            overlay_path = options.get("overlay_path")
+            if not overlay_path:
+                return "Select an overlay image file."
+            if not Path(overlay_path).exists():
+                return f"Overlay image not found: {overlay_path}"
+
+        if options["interleave"]:
+            interleave_path = options.get("interleave_path")
+            if not interleave_path:
+                return "Select a secondary video to interleave."
+            if not Path(interleave_path).exists():
+                return f"Secondary video not found: {interleave_path}"
+            if options.get("interleave_segment", 0) <= 0:
+                return "Interleave segment length must be greater than zero."
+
+        if options["add_audio"]:
+            audio_path = options.get("audio_path")
+            if not audio_path:
+                return "Select an audio file to add."
+            if not Path(audio_path).exists():
+                return f"Audio file not found: {audio_path}"
+
+        if options["zoom_in"] and options["zoom_in_factor"] <= 1.0:
+            return "Zoom-in factor must be greater than 1.0."
+
+        if options["zoom_out"]:
+            zoom_out_factor = options.get("zoom_out_factor", 1.0)
+            if not (0.0 < zoom_out_factor < 1.0):
+                return "Zoom-out factor must be between 0 and 1."
+
+        return None
+
+    def _find_latest_file(self, directory: Path) -> Optional[str]:
+        try:
+            files = [entry for entry in Path(directory).iterdir() if entry.is_file()]
+        except Exception:
+            return None
+
+        if not files:
+            return None
+
+        latest = max(files, key=lambda f: f.stat().st_mtime)
+        return str(latest)
+
+    def _start_edit_worker(self, input_path: str) -> bool:
+        options = self._gather_edit_options()
+        validation_error = self._validate_edit_options(options)
+        if validation_error:
+            QMessageBox.warning(self, "Edit Options", validation_error)
+            return False
+
+        self.status_label.setText("Applying video edits...")
+        self.progress_bar.setRange(0, 0)
+
+        output_dir = self.last_output_dir or Path(input_path).parent
+        worker = VideoEditingWorker(input_path=input_path, output_dir=output_dir, options=options)
+        worker.setParent(self)
+        worker.progress.connect(self.on_edit_progress)
+        worker.finished.connect(self.on_edit_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.edit_worker = worker
+        worker.start()
+        return True
+
+    def on_edit_progress(self, message: str) -> None:
+        if message:
+            self.status_label.setText(message)
+
+    def on_edit_finished(self, success: bool, message: str, output_path: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.edit_worker = None
+
+        if success:
+            self.progress_bar.setValue(100)
+            self.status_label.setText(f"Edits complete: {output_path}")
+            self.last_download_path = output_path
+            QMessageBox.information(self, "Editing Complete", f"Edited video saved to:\n{output_path}")
+            self._update_last_video_label()
+        else:
+            self.progress_bar.setValue(0)
+            error_text = message or "Video editing failed."
+            self.status_label.setText(error_text)
+            QMessageBox.critical(self, "Editing Failed", error_text)
+
+        self._set_working_state(False, mode="download")
+
+    def prepare_shutdown(self) -> None:
+        self._cancel_worker(self.active_worker)
+        self.active_worker = None
+        self.active_mode = None
+        self._cancel_worker(self.edit_worker)
+        self.edit_worker = None
+
+    def _cancel_worker(self, worker: Optional[QThread]) -> None:
+        if not worker:
+            return
+        try:
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            worker.requestInterruption()
+            if not worker.wait(5000):
+                worker.terminate()
+                worker.wait(1000)
+        except Exception:
+            pass
+
     def on_formats_ready(self, formats: List[Dict[str, Any]], info: Dict[str, Any]) -> None:
         self.current_formats = formats
         self.format_map.clear()
         self.formats_combo.clear()
+
+        supports_selection = self._platform_supports_format_selection()
 
         video_formats: List[Dict[str, Any]] = []
         for fmt in formats:
@@ -681,10 +2066,9 @@ class UtilitiesTab(QWidget):
             if vcodec and vcodec != "none":
                 video_formats.append(fmt)
 
-        if not video_formats:
-            self.formats_combo.setEnabled(False)
-            self.download_btn.setEnabled(False)
-            self.status_label.setText("No downloadable formats found.")
+        if supports_selection and not video_formats:
+            self._update_format_controls(False)
+            self.status_label.setText("No downloadable video formats found.")
             return
 
         def sort_key(fmt: Dict[str, Any]) -> tuple:
@@ -695,25 +2079,34 @@ class UtilitiesTab(QWidget):
 
         sorted_formats = sorted(video_formats, key=sort_key, reverse=True)
 
-        for fmt in sorted_formats:
-            label = self._format_description(fmt)
-            self.formats_combo.addItem(label)
-            fmt_id = fmt.get("format_id")
-            if fmt_id:
-                acodec = fmt.get("acodec")
-                if acodec == "none":
-                    fmt_id_with_audio = f"{fmt_id}+bestaudio/best"
-                else:
-                    fmt_id_with_audio = fmt_id
-                self.format_map[label] = fmt_id_with_audio
+        if supports_selection:
+            for fmt in sorted_formats:
+                label = self._format_description(fmt)
+                self.formats_combo.addItem(label)
+                fmt_id = fmt.get("format_id")
+                if fmt_id:
+                    acodec = fmt.get("acodec")
+                    if acodec == "none":
+                        fmt_id_with_audio = f"{fmt_id}+bestaudio/best"
+                    else:
+                        fmt_id_with_audio = fmt_id
+                    self.format_map[label] = fmt_id_with_audio
 
-        self.formats_combo.setEnabled(True)
-        self.download_btn.setEnabled(True)
+            has_formats = bool(self.format_map)
+            self._update_format_controls(has_formats)
+        else:
+            self.formats_combo.addItem("Best available")
+            self.format_map["Best available"] = "best"
+            self._update_format_controls(True)
+
         title = info.get("title", "")
         uploader = info.get("uploader")
         extra = f" by {uploader}" if uploader else ""
         self.video_title_label.setText(f"{title}{extra}")
-        self.status_label.setText(f"Loaded {len(sorted_formats)} formats. Select one to download.")
+        if supports_selection:
+            self.status_label.setText(f"Loaded {len(sorted_formats)} formats. Select one to download.")
+        else:
+            self.status_label.setText("Ready to download best available quality for this platform.")
 
     def on_worker_progress(self, progress: float, message: str) -> None:
         percent = max(0, min(100, int(progress * 100)))
@@ -722,16 +2115,51 @@ class UtilitiesTab(QWidget):
             self.status_label.setText(message)
 
     def on_worker_completed(self, mode: str, success: bool, message: str) -> None:
+        worker = self.active_worker if self.active_mode == mode else None
+        download_path = None
+
+        if mode == "download" and worker is not None:
+            download_path = getattr(worker, "last_downloaded_path", None)
+            if download_path:
+                self.last_download_path = download_path
+
+        if mode == "download" and success:
+            if not download_path and self.last_output_dir:
+                download_path = self._find_latest_file(self.last_output_dir)
+                if download_path:
+                    self.last_download_path = download_path
+
+            self.progress_bar.setValue(100)
+
+            if self._any_edit_selected():
+                if download_path and Path(download_path).exists():
+                    if self._start_edit_worker(download_path):
+                        return
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Video Editing",
+                        "Unable to locate the downloaded file. Skipping editing steps.",
+                    )
+
+            self._set_working_state(False, mode=mode)
+            self.status_label.setText("Download completed successfully.")
+            self._update_last_video_label()
+            return
+
         self._set_working_state(False, mode=mode)
+
         if success:
-            if mode == "download":
-                self.status_label.setText("Download completed successfully.")
-                self.progress_bar.setValue(100)
+            if mode == "fetch":
+                self.status_label.setText("Formats fetched successfully.")
+            if mode != "download":
+                self._update_last_video_label()
         else:
             error_text = message or "Operation failed."
             self.status_label.setText(error_text)
             if mode == "download":
                 QMessageBox.critical(self, "Download Failed", error_text)
+            self._update_last_video_label()
 
     def on_worker_error(self, message: str) -> None:
         if message:
@@ -747,15 +2175,15 @@ class UtilitiesTab(QWidget):
         else:
             has_formats = bool(self.format_map)
             self.fetch_btn.setEnabled(True)
-            self.formats_combo.setEnabled(has_formats)
-            self.download_btn.setEnabled(has_formats)
+            self._update_format_controls(has_formats)
+        self._update_upload_button_state()
 
     def _reset_state(self) -> None:
         self.current_formats = []
         self.format_map.clear()
         self.formats_combo.clear()
-        self.formats_combo.setEnabled(False)
-        self.download_btn.setEnabled(False)
+        self._update_format_controls(False)
+        self.fetch_btn.setEnabled(True)
         self.video_title_label.setText("")
         self.progress_bar.setValue(0)
         self.status_label.setText("Ready")
@@ -859,9 +2287,9 @@ class AutoBotGUI(QMainWindow):
             self.channels_tab = ChannelsTab(self.config_manager)
             self.tab_widget.addTab(self.channels_tab, "📺 Channels")
 
-        self.utilities_tab = UtilitiesTab()
+        self.utilities_tab = UtilitiesTab(self.config_manager)
         self.tab_widget.addTab(self.utilities_tab, "🛠 Utilities")
-        
+
         layout.addWidget(self.tab_widget)
     
     def setup_menu(self):
@@ -911,6 +2339,16 @@ class AutoBotGUI(QMainWindow):
         clipboard.setText(self.machine_key)
         if hasattr(self, "status_bar"):
             self.status_bar.showMessage("Machine key copied to clipboard", 3000)
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "utilities_tab") and self.utilities_tab:
+                self.utilities_tab.prepare_shutdown()
+            if hasattr(self, "channels_tab") and self.channels_tab:
+                self.channels_tab.prepare_shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
     
     def new_channel(self):
         """Create new channel"""

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QGroupBox, QScrollArea, QProgressBar, QStatusBar, QMenuBar, QMenu,
     QDialog, QDialogButtonBox, QGridLayout, QFrame, QListWidget, QListWidgetItem,
-    QSizePolicy, QToolButton, QButtonGroup, QInputDialog
+    QSizePolicy, QToolButton, QButtonGroup, QInputDialog, QAbstractItemView
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
 from PySide6.QtGui import QIcon, QFont, QPixmap, QAction
@@ -726,28 +726,40 @@ class ChannelsTab(QWidget):
         self.stop_all_btn.clicked.connect(self.stop_all_channels)
         self.stop_all_btn.setEnabled(False)
         toolbar_layout.addWidget(self.stop_all_btn)
+
+        self.show_columns_btn = QToolButton()
+        self.show_columns_btn.setText("Show Columns")
+        self.show_columns_btn.setPopupMode(QToolButton.InstantPopup)
+        toolbar_layout.addWidget(self.show_columns_btn)
         
         toolbar_layout.addStretch()
         
         # Channels table
         self.channels_table = QTableWidget()
-        self.channels_table.setColumnCount(8)
+        self.column_definitions = self._build_column_definitions()
+        self.channels_table.setColumnCount(len(self.column_definitions))
         self.channels_table.setHorizontalHeaderLabels([
-            "Channel ID", "Name", "Username", "Detection", "Upload Method", "Region", "Status", "Actions"
+            column["label"] for column in self.column_definitions
         ])
+        for index, column in enumerate(self.column_definitions):
+            if not column.get("default_visible", True):
+                self.channels_table.setColumnHidden(index, True)
         
         # Configure table
         header = self.channels_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setStretchLastSection(False)
         
         self.channels_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.channels_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.channels_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.channels_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.channels_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.channels_table.setWordWrap(False)
+
+        self.column_actions: List[QAction] = []
+        self._create_column_menu()
+
         self.channels_table.itemSelectionChanged.connect(self.on_selection_changed)
         self.channels_table.itemDoubleClicked.connect(self.edit_channel)
         
@@ -755,6 +767,166 @@ class ChannelsTab(QWidget):
         layout.addWidget(self.channels_table)
         self.setLayout(layout)
     
+    def _create_column_menu(self):
+        self.show_columns_menu = QMenu(self)
+        show_all_action = QAction("Show All Columns", self)
+        show_all_action.triggered.connect(self._show_all_columns)
+        self.show_columns_menu.addAction(show_all_action)
+
+        restore_defaults_action = QAction("Restore Default Columns", self)
+        restore_defaults_action.triggered.connect(self._restore_default_columns)
+        self.show_columns_menu.addAction(restore_defaults_action)
+
+        self.show_columns_menu.addSeparator()
+        self.column_actions.clear()
+        for index, column in enumerate(self.column_definitions):
+            action = QAction(column["label"], self)
+            action.setCheckable(True)
+            action.setChecked(not self.channels_table.isColumnHidden(index))
+            action.toggled.connect(lambda checked, col=index: self.set_column_visible(col, checked))
+            self.show_columns_menu.addAction(action)
+            self.column_actions.append(action)
+        self.show_columns_btn.setMenu(self.show_columns_menu)
+
+    def _show_all_columns(self) -> None:
+        for index in range(len(self.column_definitions)):
+            self.channels_table.setColumnHidden(index, False)
+        self._sync_column_actions()
+
+    def _restore_default_columns(self) -> None:
+        for index, column in enumerate(self.column_definitions):
+            self.channels_table.setColumnHidden(index, not column.get("default_visible", True))
+        self._sync_column_actions()
+
+    def _build_column_definitions(self) -> List[Dict[str, Any]]:
+        return [
+            {"id": "channel_id", "label": "Channel ID", "source": "channel_id", "default_visible": True},
+            {"id": "channel_name", "label": "Channel Name", "source": "config", "key": "channel_name", "default_visible": True},
+            {"id": "username", "label": "TikTok Username", "source": "config", "key": "username", "default_visible": True},
+            {"id": "telegram", "label": "Telegram Override", "source": "config", "key": "telegram", "default_visible": False},
+            {"id": "detect_video", "label": "Video Detection", "source": "config", "key": "detect_video", "default_visible": True},
+            {"id": "youtube_api_type", "label": "YouTube API Type", "source": "config", "key": "youtube_api_type", "default_visible": False},
+            {"id": "youtube_api_key", "label": "YouTube API Keys", "source": "config", "key": "youtube_api_key", "default_visible": False, "formatter": self._format_api_keys},
+            {"id": "api_scan_method", "label": "API Scan Method", "source": "config", "key": "api_scan_method", "default_visible": False},
+            {"id": "scan_interval", "label": "Scan Interval (s)", "source": "config", "key": "scan_interval", "default_visible": False, "alignment": Qt.AlignCenter},
+            {"id": "is_new_second", "label": "New Video Threshold (s)", "source": "config", "key": "is_new_second", "default_visible": False, "alignment": Qt.AlignCenter},
+            {"id": "upload_method", "label": "Upload Method", "source": "config", "key": "upload_method", "default_visible": True},
+            {"id": "region", "label": "Region", "source": "config", "key": "region", "default_visible": True},
+            {"id": "video_format", "label": "Video Format", "source": "config", "key": "video_format", "default_visible": False, "alignment": Qt.AlignCenter},
+            {"id": "render_video_method", "label": "Render Method", "source": "config", "key": "render_video_method", "default_visible": False},
+            {"id": "is_human", "label": "Human-like Behavior", "source": "config", "key": "is_human", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "proxy", "label": "Proxy", "source": "config", "key": "proxy", "default_visible": False},
+            {"id": "user_agent", "label": "User Agent", "source": "config", "key": "user_agent", "default_visible": False},
+            {"id": "view_port", "label": "Viewport Size", "source": "config", "key": "view_port", "default_visible": False, "alignment": Qt.AlignCenter},
+            {"id": "pipeline_scan", "label": "Pipeline: Scan", "source": "pipeline", "key": "scan", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "pipeline_download", "label": "Pipeline: Download", "source": "pipeline", "key": "download", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "pipeline_render", "label": "Pipeline: Render", "source": "pipeline", "key": "render", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "pipeline_upload", "label": "Pipeline: Upload", "source": "pipeline", "key": "upload", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "cookies", "label": "Has Cookies", "source": "cookies", "default_visible": False, "formatter": self._format_bool, "alignment": Qt.AlignCenter},
+            {"id": "status", "label": "Status", "source": "status", "default_visible": True},
+            {"id": "actions", "label": "Actions", "source": "actions", "default_visible": True},
+        ]
+
+    @staticmethod
+    def _format_bool(value: Any) -> str:
+        return "Yes" if bool(value) else "No"
+
+    @staticmethod
+    def _format_api_keys(value: Any) -> str:
+        if not value:
+            return ""
+        if isinstance(value, str):
+            cleaned = value.replace("\r", "\n")
+            parts = [part.strip() for part in cleaned.split("\n") if part.strip()]
+            return "; ".join(parts) if parts else ""
+        return str(value)
+
+    def _resolve_column_value(
+        self,
+        column: Dict[str, Any],
+        channel_id: str,
+        config: Dict[str, Any],
+        pipeline_steps: Dict[str, bool],
+        has_cookies: bool,
+        status_text: str,
+    ) -> str:
+        source = column.get("source")
+        if source == "channel_id":
+            value = channel_id
+        elif source == "config":
+            value = config.get(column.get("key", ""), "")
+            if column["id"] == "channel_name" and not value:
+                value = config.get("youtube_channel_id", channel_id)
+        elif source == "pipeline":
+            value = pipeline_steps.get(column.get("key"), False)
+        elif source == "cookies":
+            value = has_cookies
+        elif source == "status":
+            value = status_text
+        else:
+            value = ""
+
+        formatter = column.get("formatter")
+        if formatter:
+            value = formatter(value)
+
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return str(value)
+
+    def _create_actions_widget(self, channel_id: str, is_running: bool) -> QWidget:
+        controls_widget = QWidget()
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+
+        start_btn = QPushButton("Start")
+        stop_btn = QPushButton("Stop")
+
+        start_btn.setEnabled(not is_running)
+        stop_btn.setEnabled(is_running)
+
+        start_btn.clicked.connect(lambda checked, cid=channel_id: self.start_channel_pipeline(cid))
+        stop_btn.clicked.connect(lambda checked, cid=channel_id: self.stop_channel_pipeline(cid))
+
+        controls_layout.addWidget(start_btn)
+        controls_layout.addWidget(stop_btn)
+        controls_layout.addStretch()
+
+        self.start_buttons[channel_id] = start_btn
+        self.stop_buttons[channel_id] = stop_btn
+        return controls_widget
+
+    def set_column_visible(self, column: int, visible: bool) -> None:
+        if column < 0 or column >= len(self.column_definitions):
+            return
+
+        if not visible:
+            remaining_visible = sum(
+                1
+                for idx in range(len(self.column_definitions))
+                if idx != column and not self.channels_table.isColumnHidden(idx)
+            )
+            if remaining_visible == 0:
+                action = self.column_actions[column]
+                action.blockSignals(True)
+                action.setChecked(True)
+                action.blockSignals(False)
+                return
+
+        self.channels_table.setColumnHidden(column, not visible)
+        self._sync_column_actions()
+
+    def _sync_column_actions(self) -> None:
+        for idx, action in enumerate(self.column_actions):
+            desired = not self.channels_table.isColumnHidden(idx)
+            if action.isChecked() != desired:
+                action.blockSignals(True)
+                action.setChecked(desired)
+                action.blockSignals(False)
+
     def refresh_channels(self):
         """Refresh channels list"""
         channels = self.config_manager.get_channels()
@@ -780,68 +952,42 @@ class ChannelsTab(QWidget):
         
         for row, (channel_id, data) in enumerate(channels.items()):
             config = data['config']
-            
-            # Channel ID
-            self.channels_table.setItem(row, 0, QTableWidgetItem(channel_id))
-            
-            # Name
-            name = config.get('channel_name', channel_id)
-            self.channels_table.setItem(row, 1, QTableWidgetItem(name))
-            
-            # Username
-            username = config.get('username', '')
-            self.channels_table.setItem(row, 2, QTableWidgetItem(username))
-            
-            # Detection method
-            detection = config.get('detect_video', 'websub')
-            self.channels_table.setItem(row, 3, QTableWidgetItem(detection))
-            
-            # Upload method
-            upload_method = config.get('upload_method', 'api')
-            self.channels_table.setItem(row, 4, QTableWidgetItem(upload_method))
-            
-            # Region
-            region = config.get('region', 'ap-northeast-3')
-            self.channels_table.setItem(row, 5, QTableWidgetItem(region))
-            
-            # Status
-            has_cookies = bool(data['cookies'])
+            pipeline_steps = autobot._sanitize_pipeline_steps(config.get("pipeline_steps"))
+            has_cookies = bool(data.get('cookies'))
+            is_running = channel_id in self.pipeline_workers
             base_status = "✓ Ready" if has_cookies else "⚠ No Cookies"
-            if channel_id in self.pipeline_workers:
-                default_status = "⏱ Running..."
-            else:
-                default_status = base_status
-
+            default_status = "⏱ Running..." if is_running else base_status
             status_text = self.last_status_message.get(channel_id, default_status)
-            status_item = QTableWidgetItem(status_text)
-            self.channels_table.setItem(row, 6, status_item)
-            self.status_items[channel_id] = status_item
             self.last_status_message.setdefault(channel_id, status_text)
 
-            # Action buttons
-            controls_widget = QWidget()
-            controls_layout = QHBoxLayout(controls_widget)
-            controls_layout.setContentsMargins(0, 0, 0, 0)
-            controls_layout.setSpacing(6)
+            for column_index, column in enumerate(self.column_definitions):
+                source = column.get("source")
+                if source == "actions":
+                    controls_widget = self._create_actions_widget(channel_id, is_running)
+                    self.channels_table.setCellWidget(row, column_index, controls_widget)
+                    continue
 
-            start_btn = QPushButton("Start")
-            stop_btn = QPushButton("Stop")
+                value = self._resolve_column_value(
+                    column,
+                    channel_id,
+                    config,
+                    pipeline_steps,
+                    has_cookies,
+                    status_text,
+                )
 
-            start_btn.setEnabled(channel_id not in self.pipeline_workers)
-            stop_btn.setEnabled(channel_id in self.pipeline_workers)
-
-            start_btn.clicked.connect(lambda checked, cid=channel_id: self.start_channel_pipeline(cid))
-            stop_btn.clicked.connect(lambda checked, cid=channel_id: self.stop_channel_pipeline(cid))
-
-            controls_layout.addWidget(start_btn)
-            controls_layout.addWidget(stop_btn)
-            controls_layout.addStretch()
-
-            self.channels_table.setCellWidget(row, 7, controls_widget)
-            self.start_buttons[channel_id] = start_btn
-            self.stop_buttons[channel_id] = stop_btn
+                item = QTableWidgetItem(value)
+                if value:
+                    item.setToolTip(value)
+                alignment = column.get("alignment")
+                if alignment is not None:
+                    item.setTextAlignment(alignment)
+                self.channels_table.setItem(row, column_index, item)
+                if column["id"] == "status":
+                    self.status_items[channel_id] = item
 
         self.update_bulk_controls()
+        self._sync_column_actions()
     
     def on_selection_changed(self):
         """Handle selection change"""
@@ -1023,6 +1169,23 @@ class ChannelsTab(QWidget):
                     QMessageBox.information(self, "Success", "Channel deleted successfully!")
                 else:
                     QMessageBox.critical(self, "Error", "Failed to delete channel!")
+
+    def prepare_shutdown(self) -> None:
+        for worker in list(self.pipeline_workers.values()):
+            try:
+                worker.request_stop()
+            except Exception:
+                pass
+
+        for channel_id, worker in list(self.pipeline_workers.items()):
+            try:
+                if not worker.wait(5000):
+                    worker.terminate()
+                    worker.wait(1000)
+            except Exception:
+                pass
+            finally:
+                self.pipeline_workers.pop(channel_id, None)
 
 
 # Export the additional classes for the main file
