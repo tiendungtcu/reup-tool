@@ -1,0 +1,23 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# Virtual environments
+venv/
+.env/
+.env*/
+
+# Logs and temp files
+log/
+*.log
+
+# Downloads/output
+downloads/
+processed/
+
+# Node modules (if any)
+node_modules/

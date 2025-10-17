@@ -1,0 +1,26 @@
+{
+  "youtube_channel_id": "UCiz19rgacvujLo0-FH8u5xA",
+  "channel_name": "UCiz19rgacvujLo0-FH8u5xA",
+  "youtube_api_key": "AIzaSyB_LiqDEWOzgdIRQTPe9j_5jKzMKME2sH0",
+  "api_scan_method": "sequence",
+  "youtube_api_type": "activities",
+  "telegram": "6601226586|8295256760:AAF5xzq_Emngvp-g8SqhASJBLcvjJHvjr4Y",
+  "proxy": "35.235.120.222:47218:congdung:congdung",
+  "username": "https://www.tiktok.com/@ch2shinobue1",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+  "view_port": "1280x720",
+  "video_format": "bestvideo[height=720][ext=mp4][vcodec*=avc]+bestaudio[ext=m4a]/bestvideo[width=720][ext=mp4][vcodec*=avc]+bestaudio[ext=m4a]/best[height<=720]/18",
+  "render_video_method": "repeat",
+  "detect_video": "api",
+  "is_new_second": 86400,
+  "scan_interval": 5,
+  "is_human": 0,
+  "upload_method": "api",
+  "region": "us-east-1",
+  "pipeline_steps": {
+    "scan": true,
+    "download": true,
+    "render": true,
+    "upload": true
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "youtube_channel_id": "UCA07aKOcKpnh7ZzQlAT3eEA",
+  "youtube_api_key": "AIzaSyAerUqVF8gxsNAEVkfoI-1D4LxgfUztoxI;AIzaSyB_LiqDEWOzgdIRQTPe9j_5jKzMKME2sH2",
+  "api_scan_method": "sequence",
+  "youtube_api_type": "activities",
+  "telegram": "6601226586|8295256760:AAF5xzq_Emngvp-g8SqhASJBLcvjJHvjr4Y",
+  "proxy": "34.180.91.127:47787:congdung:congdung",
+  "username": "Danny",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36",
+  "view_port": "1280x720",
+  "video_format": "18",
+  "render_video_method": "repeat",
+  "detect_video": "api",
+  "is_new_second": 36000000,
+  "scan_interval": 5,
+  "is_human": 1,
+  "upload_method": "api",
+  "region": "ap-northeast-3"
+}

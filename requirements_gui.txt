@@ -1,0 +1,37 @@
+# AutoBot GUI Requirements
+# Core GUI Framework
+PySide6>=6.5.0
+
+# Existing project dependencies (from autobot.py analysis)
+# Web automation and browser control
+patchright>=1.37.0
+
+# Video processing
+ffmpeg-python>=0.2.0
+
+# HTTP requests and networking
+requests>=2.31.0
+
+# YouTube downloading
+yt-dlp>=2023.12.30
+
+# Telegram integration
+python-telegram-bot>=20.0
+
+# Fake user agent generation
+fake-useragent>=1.4.0
+
+# Task scheduling
+schedule>=1.2.0
+
+# Ngrok tunneling
+pyngrok>=6.0.0
+
+# JSON handling (built-in to Python)
+# pathlib (built-in to Python)
+# threading (built-in to Python)
+# asyncio (built-in to Python)
+
+# Optional: Additional GUI enhancements
+# qtawesome>=1.2.0  # For better icons
+# qdarkstyle>=3.1   # For dark theme support
