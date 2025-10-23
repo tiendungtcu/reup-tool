@@ -186,7 +186,6 @@ TikTok authentication cookies:
 bot-GUI/
 ├── gui_main.py          # Main GUI application
 ├── gui_channels.py      # Channel management interface
-├── gui_pipeline.py      # Pipeline control interface
 ├── autobot.py          # Original automation script
 ├── settings.json       # Global settings
 ├── requirements_gui.txt # GUI dependencies

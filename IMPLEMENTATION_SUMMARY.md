@@ -8,10 +8,9 @@ I have successfully created a comprehensive GUI application using PySide6 for yo
 ### Core GUI Components
 1. **`gui_main.py`** - Main application window with tabs and menu system
 2. **`gui_channels.py`** - Channel management interface with CRUD operations
-3. **`gui_pipeline.py`** - Pipeline control for running operations
-4. **`launch_gui.py`** - Launcher script with dependency checking
-5. **`requirements_gui.txt`** - GUI dependencies
-6. **`README_GUI.md`** - Comprehensive documentation
+3. **`launch_gui.py`** - Launcher script with dependency checking
+4. **`requirements_gui.txt`** - GUI dependencies
+5. **`README_GUI.md`** - Comprehensive documentation
 
 ## Key Features Implemented
 

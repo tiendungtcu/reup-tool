@@ -11,7 +11,6 @@ The AutoBot GUI application has been successfully created, debugged, and deploye
 - **Solution**: Updated all imports from `QSignal` to `Signal` in:
   - `gui_main.py`
   - `gui_channels.py` 
-  - `gui_pipeline.py`
 
 ### 2. ✅ Virtual Environment Issues
 - **Problem**: Corrupted virtual environment causing Python import errors
@@ -77,7 +76,6 @@ python3 -c "from gui_main import main; main()"
 bot-GUI/
 ├── gui_main.py              # ✅ Main application (WORKING)
 ├── gui_channels.py          # ✅ Channel management (WORKING)
-├── gui_pipeline.py          # ✅ Pipeline control (WORKING)
 ├── start_gui.py            # ✅ Simple launcher (WORKING)
 ├── run_autobot_gui.sh      # ✅ Bash launcher (WORKING)
 ├── test_gui.py             # ✅ Component testing (WORKING)

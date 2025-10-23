@@ -10,6 +10,7 @@ __pycache__/
 venv/
 .env/
 .env*/
+.build-venv/
 
 # Logs and temp files
 log/
@@ -18,6 +19,8 @@ log/
 # Downloads/output
 downloads/
 processed/
+dist/
+build/
 
 # Node modules (if any)
 node_modules/

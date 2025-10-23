@@ -45,6 +45,13 @@ Thiết lập executable cho file install.sh: chmod +x install.sh
 Windows: mở Powershell terminal -> chuyển đến thư mục chứa bot -> nhập lệnh .\install.ps1
 Mac or Linux: mở bash terminal -> chuyển đến thư mục chứa bot -> nhập lệnh ./install.sh
 
+📌 **Ghi chú riêng cho macOS (Apple Silicon)**
+- Cài Homebrew (https://brew.sh/) nếu chưa có, sau đó chạy: `brew install python@3.13 ffmpeg aria2`
+- Cài đặt Google Chrome cho macOS (https://www.google.com/chrome/). Nếu đã có Chrome trong thư mục Applications thì script sẽ tái sử dụng.
+- Nếu đã có Python 3.13 qua Homebrew, thêm `eval "$(/opt/homebrew/bin/brew shellenv)"` vào shell (zsh/bash) profile để lệnh `python3.13` khả dụng.
+- Có thể chạy script mà không khởi động bot ngay bằng lệnh: `RUN_AUTOBOT=0 ./install.sh`. Khi đó, bạn có thể start bot sau bằng cách kích hoạt môi trường ảo (`source venv/bin/activate`) rồi chạy `python autobot.py`.
+- Nếu muốn bỏ qua bước tải browser của patchright (khi đã cài sẵn), đặt thêm biến `SKIP_PLAYWRIGHT_INSTALL=1` trước khi chạy script.
+
 Nếu dùng pm2 thì gõ lệnh:
 pm2 install.sh --name bot1
 

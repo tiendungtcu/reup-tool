@@ -1,5 +1,6 @@
 import time, requests, json
 import requests, json, time, subprocess, os, sys
+from app_paths import resource_path
 import uuid
 from zlib import crc32
 import concurrent.futures
@@ -270,7 +271,7 @@ def publish_video_with_retry(session, creation_id, video_id, title, markup_text,
                     print("❌ Missing msToken")
                     continue
                     
-                js_path = os.path.join(os.getcwd(), "tiktok_uploader", "tiktok-signature", "browser.js")
+                js_path = str(resource_path("tiktok_uploader", "tiktok-signature", "browser.js"))
                 sig_url = f"https://www.tiktok.com/api/v1/web/project/post/?app_name=tiktok_web&channel=tiktok_web&device_platform=web&aid=1988&msToken={mstoken}"
                 signatures = subprocess_jsvmp(js_path, user_agent, sig_url)
 

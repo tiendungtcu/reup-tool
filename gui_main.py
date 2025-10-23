@@ -10,8 +10,12 @@ import subprocess
 import threading
 import time
 from functools import lru_cache
+from copy import deepcopy
 
 from autobot import ALL_CONFIGS, channel_events, event_lock, is_rendered, upload_to_tiktok
+
+from localization import translator, tr
+from auto_updater import AutoUpdater, UpdateNotificationDialog
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,7 +26,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QToolButton, QButtonGroup, QRadioButton
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
-from PySide6.QtGui import QIcon, QFont, QPixmap, QAction
+from PySide6.QtGui import QIcon, QFont, QPixmap, QAction, QActionGroup
 
 try:
     from PIL import Image, ImageFilter
@@ -263,16 +267,16 @@ class ConfigManager:
         errors: List[str] = []
 
         if settings.get("domain_type") == "ngrok" and not settings.get("ngrok_auth_token"):
-            errors.append("Ngrok auth token is required when using ngrok domain type")
+            errors.append(tr("Ngrok auth token is required when using ngrok domain type"))
 
         if settings.get("telegram"):
             telegram = settings["telegram"]
             if "|" not in telegram:
-                errors.append("Telegram format should be: chat_id|bot_token")
+                errors.append(tr("Telegram format should be: chat_id|bot_token"))
 
         websub_port = settings.get("websub_port", 8080)
         if not isinstance(websub_port, int) or websub_port < 1000 or websub_port > 65535:
-            errors.append("WebSub port should be between 1000 and 65535")
+            errors.append(tr("WebSub port should be between 1000 and 65535"))
 
         return errors
 
@@ -281,35 +285,35 @@ class ConfigManager:
         errors: List[str] = []
 
         if not config.get("youtube_channel_id"):
-            errors.append("YouTube Channel ID is required")
+            errors.append(tr("YouTube Channel ID is required"))
         elif not config["youtube_channel_id"].startswith("UC"):
-            errors.append("YouTube Channel ID should start with 'UC'")
+            errors.append(tr("YouTube Channel ID should start with 'UC'"))
 
         if not config.get("youtube_api_key"):
-            errors.append("At least one YouTube API key is required")
+            errors.append(tr("At least one YouTube API key is required"))
 
         if config.get("proxy"):
             proxy = config["proxy"]
             parts = proxy.split(":")
             if len(parts) not in [2, 4]:
-                errors.append("Proxy format should be host:port or host:port:username:password")
+                errors.append(tr("Proxy format should be host:port or host:port:username:password."))
 
         if config.get("view_port"):
             viewport = config["view_port"]
             if "x" not in viewport:
-                errors.append("Viewport format should be widthxheight (e.g., 1280x720)")
+                errors.append(tr("Viewport format should be widthxheight (e.g., 1280x720)"))
 
         sanitized_steps = self._sanitize_pipeline_steps(config.get("pipeline_steps"))
         config["pipeline_steps"] = sanitized_steps
 
         if not sanitized_steps["scan"] and config.get("detect_video") in {"websub", "both"}:
-            errors.append("Scan step is required when using websub or both detection modes")
+            errors.append(tr("Scan step is required when using websub or both detection modes"))
 
         if sanitized_steps["upload"] and not sanitized_steps["render"]:
-            errors.append("Upload step requires render step to be enabled")
+            errors.append(tr("Upload step requires render step to be enabled"))
 
         if sanitized_steps["render"] and not sanitized_steps["download"]:
-            errors.append("Render step requires download step to be enabled")
+            errors.append(tr("Render step requires download step to be enabled"))
 
         return errors
 
@@ -472,19 +476,20 @@ class SettingsTab(QWidget):
         # Validate settings
         errors = self.config_manager.validate_settings(settings)
         if errors:
-            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
+            QMessageBox.warning(self, tr("Validation Error"), "\n".join(errors))
             return
         
         if self.config_manager.save_settings(settings):
-            QMessageBox.information(self, "Success", "Settings saved successfully!")
+            QMessageBox.information(self, tr("Success"), tr("Settings saved successfully!"))
         else:
-            QMessageBox.critical(self, "Error", "Failed to save settings!")
+            QMessageBox.critical(self, tr("Error"), tr("Failed to save settings!"))
     
     def reset_settings(self):
         """Reset settings to default"""
         reply = QMessageBox.question(
-            self, "Reset Settings", 
-            "Are you sure you want to reset all settings to default?",
+            self,
+            tr("Reset Settings"),
+            tr("Are you sure you want to reset all settings to default?"),
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -492,7 +497,7 @@ class SettingsTab(QWidget):
             default_settings = self.config_manager._default_settings()
             if self.config_manager.save_settings(default_settings):
                 self.load_settings()
-                QMessageBox.information(self, "Success", "Settings reset to default!")
+                QMessageBox.information(self, tr("Success"), tr("Settings reset to default!"))
 
 
 class YTDLPWorker(QThread):
@@ -542,7 +547,7 @@ class YTDLPWorker(QThread):
                 self.completed.emit(True, info.get("title", ""))
             elif self.mode == "download":
                 if not self.format_id or not self.output_dir:
-                    raise ValueError("Missing format selection or output directory")
+                    raise ValueError(tr("Missing format selection or output directory"))
 
                 progress_hook = lambda status: self._progress_hook(status)
                 ydl_opts = {
@@ -561,7 +566,7 @@ class YTDLPWorker(QThread):
                     ydl.download([self.url])
                 self.completed.emit(True, "Download completed")
             else:
-                raise ValueError(f"Unknown worker mode: {self.mode}")
+                raise ValueError(tr("Unknown worker mode: {mode}").format(mode=self.mode))
         except WorkerCancelled:
             self.completed.emit(False, "Operation cancelled")
         except Exception as exc:
@@ -639,7 +644,7 @@ class VideoEditingWorker(QThread):
                 raise FileNotFoundError(f"Input video not found: {self.input_path}")
 
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.progress.emit("Loading video...")
+            self.progress.emit(tr("Loading video..."))
             result_clip = VideoFileClip(str(self.input_path))
             register_clip(result_clip)
             self._ensure_running()
@@ -648,7 +653,7 @@ class VideoEditingWorker(QThread):
             if self.options.get("add_line"):
                 thickness = max(1, int(self.options.get("line_thickness", 4)))
                 color = tuple(self.options.get("line_color", (255, 255, 255)))
-                self.progress.emit("Adding center line...")
+                self.progress.emit(tr("Adding center line..."))
                 self._ensure_running()
                 line_clip = ColorClip(size=(result_clip.w, thickness), color=color)
                 line_clip = line_clip.set_duration(result_clip.duration)
@@ -662,7 +667,7 @@ class VideoEditingWorker(QThread):
             # Blur
             if self.options.get("blur") and self.options.get("blur_sigma", 0) > 0:
                 sigma = max(0.1, float(self.options.get("blur_sigma", 5.0)))
-                self.progress.emit("Applying blur...")
+                self.progress.emit(tr("Applying blur..."))
                 self._ensure_running()
                 result_clip = self._apply_gaussian_blur(result_clip, sigma)
                 register_clip(result_clip)
@@ -672,7 +677,7 @@ class VideoEditingWorker(QThread):
                 overlay_path = Path(str(self.options.get("overlay_path")))
                 if not overlay_path.exists():
                     raise FileNotFoundError(f"Overlay image not found: {overlay_path}")
-                self.progress.emit("Adding overlay image...")
+                self.progress.emit(tr("Adding overlay image..."))
                 self._ensure_running()
                 overlay_clip = ImageClip(str(overlay_path)).set_duration(result_clip.duration)
                 register_clip(overlay_clip)
@@ -695,7 +700,7 @@ class VideoEditingWorker(QThread):
                 interleave_path = Path(str(self.options.get("interleave_path")))
                 if not interleave_path.exists():
                     raise FileNotFoundError(f"Interleave video not found: {interleave_path}")
-                self.progress.emit("Interleaving videos...")
+                self.progress.emit(tr("Interleaving videos..."))
                 self._ensure_running()
                 other_clip = VideoFileClip(str(interleave_path))
                 register_clip(other_clip)
@@ -747,7 +752,7 @@ class VideoEditingWorker(QThread):
 
             # Mute original audio
             if self.options.get("mute"):
-                self.progress.emit("Muting original audio...")
+                self.progress.emit(tr("Muting original audio..."))
                 self._ensure_running()
                 result_clip = result_clip.without_audio()
                 register_clip(result_clip)
@@ -757,7 +762,7 @@ class VideoEditingWorker(QThread):
                 audio_path = Path(str(self.options.get("audio_path")))
                 if not audio_path.exists():
                     raise FileNotFoundError(f"Audio file not found: {audio_path}")
-                self.progress.emit("Adding custom audio...")
+                self.progress.emit(tr("Adding custom audio..."))
                 self._ensure_running()
                 base_audio = AudioFileClip(str(audio_path))
                 audio_resources.append(base_audio)
@@ -776,7 +781,7 @@ class VideoEditingWorker(QThread):
             if self.options.get("rotate"):
                 angle = float(self.options.get("rotate_degrees", 0.0))
                 if angle % 360:
-                    self.progress.emit("Rotating video...")
+                    self.progress.emit(tr("Rotating video..."))
                     self._ensure_running()
                     result_clip = result_clip.rotate(angle)
                     register_clip(result_clip)
@@ -785,7 +790,7 @@ class VideoEditingWorker(QThread):
             if self.options.get("zoom_in"):
                 factor = float(self.options.get("zoom_in_factor", 1.0))
                 if factor > 1.0:
-                    self.progress.emit("Zooming in...")
+                    self.progress.emit(tr("Zooming in..."))
                     self._ensure_running()
                     zoomed = result_clip.fx(vfx.resize, factor)
                     register_clip(zoomed)
@@ -802,7 +807,7 @@ class VideoEditingWorker(QThread):
             if self.options.get("zoom_out"):
                 factor = float(self.options.get("zoom_out_factor", 1.0))
                 if 0 < factor < 1.0:
-                    self.progress.emit("Zooming out...")
+                    self.progress.emit(tr("Zooming out..."))
                     self._ensure_running()
                     scaled = result_clip.fx(vfx.resize, factor)
                     register_clip(scaled)
@@ -827,7 +832,7 @@ class VideoEditingWorker(QThread):
                 output_path = self.output_dir / f"{self.input_path.stem}_edited_{counter}{suffix}"
                 counter += 1
 
-            self.progress.emit("Rendering edited video...")
+            self.progress.emit(tr("Rendering edited video..."))
             self._ensure_running()
             temp_audio = self.output_dir / f"{self.input_path.stem}_temp_audio.m4a"
             result_clip.write_videofile(
@@ -841,7 +846,7 @@ class VideoEditingWorker(QThread):
                 verbose=False,
             )
 
-            self.progress.emit("Finished video editing")
+            self.progress.emit(tr("Finished video editing"))
             self.finished.emit(True, "Video edits applied successfully.", str(output_path))
         except Exception as exc:
             self.finished.emit(False, str(exc), "")
@@ -909,7 +914,7 @@ class TikTokUploadWorker(QThread):
         previous_render = is_rendered.get(self.channel_id)
         event_created = False
         try:
-            self.progress.emit("Preparing TikTok upload...")
+            self.progress.emit(tr("Preparing TikTok upload..."))
             with event_lock:
                 upload_event = channel_events.get(self.channel_id)
                 if upload_event is None:
@@ -924,7 +929,7 @@ class TikTokUploadWorker(QThread):
             }
             is_rendered[self.channel_id] = True
 
-            self.progress.emit("Uploading video to TikTok...")
+            self.progress.emit(tr("Uploading video to TikTok..."))
             success = bool(
                 upload_to_tiktok(
                     self.channel_id,
@@ -973,8 +978,12 @@ class UtilitiesTab(QWidget):
         self.upload_channel_combo: Optional[QComboBox] = None
         self.refresh_channels_btn: Optional[QPushButton] = None
         self.custom_cookie_edit: Optional[QTextEdit] = None
+        self.custom_proxy_edit: Optional[QLineEdit] = None
         self.load_cookie_file_btn: Optional[QPushButton] = None
         self.clear_cookie_btn: Optional[QPushButton] = None
+        self.upload_method_group: Optional[QButtonGroup] = None
+        self.browser_method_radio: Optional[QRadioButton] = None
+        self.api_method_radio: Optional[QRadioButton] = None
         self.use_last_video_radio: Optional[QRadioButton] = None
         self.use_other_video_radio: Optional[QRadioButton] = None
         self.last_video_path_label: Optional[QLabel] = None
@@ -985,6 +994,7 @@ class UtilitiesTab(QWidget):
         self.cookie_source_group: Optional[QButtonGroup] = None
         self.video_source_group: Optional[QButtonGroup] = None
         self.upload_channel_entries: List[Dict[str, Any]] = []
+        self._syncing_custom_proxy = False
         self._setup_ui()
         self.refresh_upload_channels(initial=True)
         self._update_last_video_label()
@@ -1339,6 +1349,35 @@ class UtilitiesTab(QWidget):
         self.custom_cookie_edit.textChanged.connect(self._on_custom_cookies_changed)
         layout.addWidget(self.custom_cookie_edit)
 
+        proxy_form = QFormLayout()
+        proxy_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self.custom_proxy_edit = QLineEdit()
+        self.custom_proxy_edit.setPlaceholderText("host:port or host:port:username:password")
+        self.custom_proxy_edit.setEnabled(False)
+        self.custom_proxy_edit.textChanged.connect(self._on_custom_proxy_changed)
+        proxy_form.addRow("Upload Proxy:", self.custom_proxy_edit)
+        layout.addLayout(proxy_form)
+
+        method_layout = QHBoxLayout()
+        method_label = QLabel("Upload method:")
+        method_layout.addWidget(method_label)
+
+        self.upload_method_group = QButtonGroup(self)
+        self.upload_method_group.setExclusive(True)
+
+        self.browser_method_radio = QRadioButton("Browser")
+        self.api_method_radio = QRadioButton("API")
+        self.browser_method_radio.setChecked(True)
+
+        self.upload_method_group.addButton(self.browser_method_radio)
+        self.upload_method_group.addButton(self.api_method_radio)
+
+        method_layout.addWidget(self.browser_method_radio)
+        method_layout.addWidget(self.api_method_radio)
+        method_layout.addStretch()
+        layout.addLayout(method_layout)
+
         layout.addSpacing(4)
         video_label = QLabel("Select the video to upload")
         video_label.setWordWrap(True)
@@ -1353,11 +1392,11 @@ class UtilitiesTab(QWidget):
         self.video_source_group.addButton(self.use_last_video_radio)
         layout.addWidget(self.use_last_video_radio)
 
-        self.last_video_path_label = QLabel("No video available yet.")
+        self.last_video_path_label = QLabel(tr("No video available yet."))
         self.last_video_path_label.setWordWrap(True)
         layout.addWidget(self.last_video_path_label)
 
-        self.use_other_video_radio = QRadioButton("Select another video file")
+        self.use_other_video_radio = QRadioButton(tr("Select another video file"))
         self.use_other_video_radio.toggled.connect(self._update_video_widgets)
         self.video_source_group.addButton(self.use_other_video_radio)
         layout.addWidget(self.use_other_video_radio)
@@ -1396,7 +1435,7 @@ class UtilitiesTab(QWidget):
         if self.refresh_channels_btn:
             self.refresh_channels_btn.setEnabled(use_channel)
 
-        for widget in (self.custom_cookie_edit, self.load_cookie_file_btn, self.clear_cookie_btn):
+        for widget in (self.custom_cookie_edit, self.load_cookie_file_btn, self.clear_cookie_btn, self.custom_proxy_edit):
             if widget:
                 widget.setEnabled(use_custom)
 
@@ -1422,6 +1461,10 @@ class UtilitiesTab(QWidget):
             else:
                 self.upload_status_label.setText("")
 
+        if entry and self.use_channel_radio and self.use_channel_radio.isChecked():
+            config = entry.get("config") or {}
+            self._set_upload_method_radio(config.get("upload_method"))
+
         self._update_upload_button_state()
 
     def _selected_channel_entry(self) -> Optional[Dict[str, Any]]:
@@ -1439,7 +1482,7 @@ class UtilitiesTab(QWidget):
             channels = self.config_manager.get_channels()
         except Exception as exc:
             if not initial:
-                QMessageBox.critical(self, "Failed to load channels", str(exc))
+                QMessageBox.critical(self, tr("Failed to load channels"), str(exc))
             return
 
         entries: List[Dict[str, Any]] = []
@@ -1509,15 +1552,97 @@ class UtilitiesTab(QWidget):
             if self.use_custom_radio and not self.use_custom_radio.isChecked():
                 self.use_custom_radio.setChecked(True)
         except Exception as exc:
-            QMessageBox.critical(self, "Load Cookies Failed", f"Could not load cookies:\n{exc}")
+            QMessageBox.critical(
+                self,
+                tr("Load Cookies Failed"),
+                tr("Could not load cookies:\n{error}").format(error=exc),
+            )
 
     def clear_custom_cookies(self) -> None:
         if self.custom_cookie_edit:
             self.custom_cookie_edit.clear()
+        if self.custom_proxy_edit:
+            self._set_custom_proxy_text("")
+        self._set_upload_method_radio("browser")
         self._update_upload_button_state()
 
     def _on_custom_cookies_changed(self) -> None:
         self._update_upload_button_state()
+        self._sync_proxy_from_cookie_text()
+
+    def _on_custom_proxy_changed(self, _text: str) -> None:
+        if self._syncing_custom_proxy:
+            return
+
+    def _sync_proxy_from_cookie_text(self) -> None:
+        if not self.custom_cookie_edit or not self.custom_proxy_edit:
+            return
+        if self._syncing_custom_proxy:
+            return
+        raw_text = self.custom_cookie_edit.toPlainText().strip()
+        if not raw_text:
+            self._set_custom_proxy_text("")
+            return
+        try:
+            data = json.loads(raw_text)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            proxy_value = str(data.get("proxy", "") or "").strip()
+            self._set_custom_proxy_text(proxy_value)
+            method_value = str(data.get("upload_method", "") or "").strip().lower()
+            if method_value in {"browser", "api"}:
+                self._set_upload_method_radio(method_value)
+
+    def _set_custom_proxy_text(self, value: str) -> None:
+        if not self.custom_proxy_edit:
+            return
+        sanitized = (value or "").strip()
+        if self.custom_proxy_edit.text() == sanitized:
+            return
+        self._syncing_custom_proxy = True
+        try:
+            self.custom_proxy_edit.setText(sanitized)
+        finally:
+            self._syncing_custom_proxy = False
+
+    def _current_custom_proxy(self) -> str:
+        if not self.custom_proxy_edit:
+            return ""
+        return self.custom_proxy_edit.text().strip()
+
+    def _set_upload_method_radio(self, method: Optional[str]) -> None:
+        if not self.browser_method_radio or not self.api_method_radio:
+            return
+        normalized = (method or "").strip().lower()
+        if normalized == "api":
+            self.api_method_radio.setChecked(True)
+        else:
+            self.browser_method_radio.setChecked(True)
+
+    def _selected_upload_method(self) -> str:
+        if self.api_method_radio and self.api_method_radio.isChecked():
+            return "api"
+        return "browser"
+
+    @staticmethod
+    def _is_valid_proxy_format(proxy: str) -> bool:
+        if not proxy:
+            return True
+        parts = [part.strip() for part in proxy.split(":")]
+        if len(parts) not in (2, 4):
+            return False
+        host, port = parts[0], parts[1]
+        if not host or not port.isdigit():
+            return False
+        port_value = int(port)
+        if port_value < 1 or port_value > 65535:
+            return False
+        if len(parts) == 4:
+            username, password = parts[2], parts[3]
+            if not username or not password:
+                return False
+        return True
 
     def _browse_custom_video(self) -> None:
         start_dir = (
@@ -1589,21 +1714,28 @@ class UtilitiesTab(QWidget):
 
     def _parse_custom_cookies(self) -> Any:
         if not self.custom_cookie_edit:
-            raise ValueError("Custom cookies editor unavailable.")
+            raise ValueError(tr("Custom cookies editor unavailable."))
 
         raw_text = self.custom_cookie_edit.toPlainText().strip()
         if not raw_text:
-            raise ValueError("Paste custom cookies JSON or load from file before uploading.")
+            raise ValueError(tr("Paste custom cookies JSON or load from file before uploading."))
+
+        proxy_value = self._current_custom_proxy()
+        if proxy_value and not self._is_valid_proxy_format(proxy_value):
+            raise ValueError(tr("Proxy format should be host:port or host:port:username:password."))
 
         try:
             data = json.loads(raw_text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid cookies JSON: {exc}")
+            raise ValueError(tr("Invalid cookies JSON: {error}").format(error=exc))
 
         if isinstance(data, (list, tuple)) and not data:
-            raise ValueError("Custom cookies JSON is empty.")
+            raise ValueError(tr("Custom cookies JSON is empty."))
         if isinstance(data, dict) and not data:
-            raise ValueError("Custom cookies JSON is empty.")
+            raise ValueError(tr("Custom cookies JSON is empty."))
+
+        if isinstance(data, dict):
+            data["upload_method"] = self._selected_upload_method()
 
         return data
 
@@ -1618,32 +1750,40 @@ class UtilitiesTab(QWidget):
         if self.upload_worker and self.upload_worker.isRunning():
             QMessageBox.information(
                 self,
-                "Upload In Progress",
-                "Please wait for the current upload to finish before starting a new one.",
+                tr("Upload In Progress"),
+                tr("Please wait for the current upload to finish before starting a new one."),
             )
             return
 
         video_path = self._current_upload_video_path()
         if not video_path:
-            QMessageBox.warning(self, "Video Selection", "Select a video to upload.")
+            QMessageBox.warning(self, tr("Video Selection"), tr("Select a video to upload."))
             return
 
         video_file = Path(video_path)
         if not video_file.exists():
-            QMessageBox.warning(self, "Video Missing", f"Selected video not found:\n{video_path}")
+            QMessageBox.warning(
+                self,
+                tr("Video Missing"),
+                tr("Selected video not found:\n{path}").format(path=video_path),
+            )
             return
 
         try:
+            selected_method = self._selected_upload_method()
             if self.use_channel_radio and self.use_channel_radio.isChecked():
                 entry = self._selected_channel_entry()
                 if not entry:
-                    raise ValueError("Choose a channel with stored TikTok cookies.")
+                    raise ValueError(tr("Choose a channel with stored TikTok cookies."))
                 if not entry.get("has_cookies"):
-                    raise ValueError("Selected channel does not have cookies configured.")
+                    raise ValueError(tr("Selected channel does not have cookies configured."))
                 channel_id = entry["id"]
                 base_config = dict(entry.get("config") or {})
                 config = self.config_manager._merge_channel_defaults(base_config)
-                cookies = entry.get("cookies") or {}
+                config["upload_method"] = selected_method
+                cookies = deepcopy(entry.get("cookies") or {})
+                if isinstance(cookies, dict):
+                    cookies["upload_method"] = selected_method
             else:
                 cookies = self._parse_custom_cookies()
                 channel_id = "__gui_custom__"
@@ -1654,13 +1794,25 @@ class UtilitiesTab(QWidget):
                         "is_human": 0,
                     }
                 )
+                config["upload_method"] = selected_method
+                proxy_value = self._current_custom_proxy()
+                config["proxy"] = proxy_value
+                if isinstance(cookies, dict):
+                    if proxy_value:
+                        cookies["proxy"] = proxy_value
+                    elif "proxy" in cookies:
+                        del cookies["proxy"]
+                    cookies["upload_method"] = selected_method
+            proxy_value = str(config.get("proxy", "") or "").strip()
+            if proxy_value and not self._is_valid_proxy_format(proxy_value):
+                raise ValueError(tr("Proxy format should be host:port or host:port:username:password."))
         except ValueError as exc:
-            QMessageBox.warning(self, "Upload Configuration", str(exc))
+            QMessageBox.warning(self, tr("Upload Configuration"), str(exc))
             return
 
         video_title = self._derive_video_title(str(video_file))
 
-        self.upload_status_label.setText("Preparing upload...")
+        self.upload_status_label.setText(tr("Preparing upload..."))
 
         worker = TikTokUploadWorker(
             channel_id=channel_id,
@@ -1685,9 +1837,9 @@ class UtilitiesTab(QWidget):
     def _on_upload_completed(self, success: bool, message: str) -> None:
         self.upload_status_label.setText(message)
         if not success:
-            QMessageBox.critical(self, "Upload Failed", message)
+            QMessageBox.critical(self, tr("Upload Failed"), message)
         else:
-            QMessageBox.information(self, "Upload Complete", message)
+            QMessageBox.information(self, tr("Upload Complete"), message)
 
         self.upload_worker = None
         self._update_upload_button_state()
@@ -1715,14 +1867,14 @@ class UtilitiesTab(QWidget):
     def fetch_formats(self) -> None:
         url = self.url_edit.text().strip()
         if not url:
-            QMessageBox.warning(self, "Missing URL", "Please enter a video URL or ID.")
+            QMessageBox.warning(self, tr("Missing URL"), tr("Please enter a video URL or ID."))
             return
 
         url = self._normalize_url(url)
 
         self._reset_state()
         self._set_working_state(True, mode="fetch")
-        self.status_label.setText("Fetching available formats...")
+        self.status_label.setText(tr("Fetching available formats..."))
 
         worker = YTDLPWorker(url=url, mode="fetch")
         worker.setParent(self)
@@ -1740,13 +1892,13 @@ class UtilitiesTab(QWidget):
         if self.edit_worker and self.edit_worker.isRunning():
             QMessageBox.warning(
                 self,
-                "Editing In Progress",
-                "Please wait for the current video editing to finish before starting a new download.",
+                tr("Editing In Progress"),
+                tr("Please wait for the current video editing to finish before starting a new download."),
             )
             return
 
         if not self.current_url:
-            QMessageBox.warning(self, "No Video", "Please fetch video formats first.")
+            QMessageBox.warning(self, tr("No Video"), tr("Please fetch video formats first."))
             return
 
         manual_format_required = not self._platform_supports_format_selection()
@@ -1755,7 +1907,7 @@ class UtilitiesTab(QWidget):
             if manual_format_required:
                 selected_label = self.formats_combo.currentText() or next(iter(self.format_map), None)
             else:
-                QMessageBox.warning(self, "No Format", "Please select a video format to download.")
+                QMessageBox.warning(self, tr("No Format"), tr("Please select a video format to download."))
                 return
         else:
             selected_label = self.formats_combo.currentText()
@@ -1767,24 +1919,28 @@ class UtilitiesTab(QWidget):
         format_id = self.format_map.get(format_label, "best")
 
         if manual_format_required:
-            self.status_label.setText("Using best available format for selected platform.")
+            self.status_label.setText(tr("Using best available format for selected platform."))
 
         if not format_id:
-            QMessageBox.warning(self, "No Format", "Please select a video format to download.")
+            QMessageBox.warning(self, tr("No Format"), tr("Please select a video format to download."))
             return
 
         output_dir = Path(self.folder_edit.text().strip() or ".").expanduser()
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Folder Error", f"Failed to create output folder: {exc}")
+            QMessageBox.critical(
+                self,
+                tr("Folder Error"),
+                tr("Failed to create output folder: {error}").format(error=exc),
+            )
             return
 
         self.last_output_dir = output_dir
         self.last_download_path = None
 
         self._set_working_state(True, mode="download")
-        self.status_label.setText("Starting download...")
+        self.status_label.setText(tr("Starting download..."))
         self.progress_bar.setValue(0)
 
         worker = YTDLPWorker(
@@ -1804,16 +1960,20 @@ class UtilitiesTab(QWidget):
         self._update_last_video_label()
 
     def choose_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.folder_edit.text())
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            tr("Select Download Folder"),
+            self.folder_edit.text(),
+        )
         if folder:
             self.folder_edit.setText(folder)
 
     def choose_overlay_image(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Overlay Image",
+            tr("Select overlay image"),
             str(Path(self.folder_edit.text()).expanduser()),
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*)",
+            tr("Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*)"),
         )
         if file_path:
             self.overlay_path_edit.setText(file_path)
@@ -1823,9 +1983,9 @@ class UtilitiesTab(QWidget):
     def choose_interleave_video(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Secondary Video",
+            tr("Select secondary video"),
             str(Path(self.folder_edit.text()).expanduser()),
-            "Video Files (*.mp4 *.mov *.mkv *.webm *.m4v *.avi);;All Files (*)",
+            tr("Video Files (*.mp4 *.mov *.mkv *.webm *.m4v *.avi);;All Files (*)"),
         )
         if file_path:
             self.interleave_path_edit.setText(file_path)
@@ -1835,9 +1995,9 @@ class UtilitiesTab(QWidget):
     def choose_audio_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Audio File",
+            tr("Select audio file"),
             str(Path(self.folder_edit.text()).expanduser()),
-            "Audio Files (*.mp3 *.wav *.aac *.m4a *.ogg *.flac);;All Files (*)",
+            tr("Audio Files (*.mp3 *.wav *.aac *.m4a *.ogg *.flac);;All Files (*)"),
         )
         if file_path:
             self.audio_path_edit.setText(file_path)
@@ -2239,6 +2399,8 @@ class AutoBotGUI(QMainWindow):
         self.setup_ui()
         self.setup_menu()
         self.setup_status_bar()
+        self._initialize_localization()
+        self._setup_auto_updater()
         
     def setup_ui(self):
         """Setup the main UI"""
@@ -2291,7 +2453,107 @@ class AutoBotGUI(QMainWindow):
         self.tab_widget.addTab(self.utilities_tab, "🛠 Utilities")
 
         layout.addWidget(self.tab_widget)
+
+        language_layout = QHBoxLayout()
+        language_layout.setContentsMargins(0, 0, 0, 0)
+        language_layout.addStretch()
+
+        self.language_menu = QMenu(self)
+        self.language_action_group = QActionGroup(self)
+        self.language_action_group.setExclusive(True)
+        self.language_actions = {}
+
+        self.language_button = QPushButton("Switch Language")
+        self.language_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.language_button.setMenu(self.language_menu)
+
+        self._populate_language_menu()
+
+        language_layout.addWidget(self.language_button)
+        layout.addLayout(language_layout)
     
+    def _populate_language_menu(self) -> None:
+        if not hasattr(self, "language_menu"):
+            return
+
+        for action in list(self.language_action_group.actions()):
+            self.language_action_group.removeAction(action)
+
+        self.language_menu.clear()
+        self.language_actions.clear()
+
+        base_labels = {"en": "English", "vi": "Vietnamese"}
+        language_codes = [
+            code for code in translator.available_languages() if isinstance(code, str)
+        ]
+        language_codes.sort(key=lambda code: (0 if code == translator.default_language else 1, code))
+
+        for code in language_codes:
+            base_text = base_labels.get(code, code.upper())
+            action = self.language_menu.addAction(base_text)
+            action.setCheckable(True)
+            action.setData(code)
+            action.triggered.connect(lambda _checked=False, lang=code: self.change_language(lang))
+            self.language_action_group.addAction(action)
+            self.language_actions[code] = action
+
+        self._update_language_menu_checks(translator.current_language)
+
+    def _update_language_button_text(self) -> None:
+        if not hasattr(self, "language_button"):
+            return
+        current_label = translator.language_label(translator.current_language)
+        self.language_button.setText(f"{tr('Language')}: {current_label}")
+
+    def _update_language_menu_checks(self, language_code: str) -> None:
+        for code, action in self.language_actions.items():
+            try:
+                action.setChecked(code == language_code)
+            except RuntimeError:
+                pass
+
+    def _initialize_localization(self) -> None:
+        translator.bind_widget_tree(self)
+        if getattr(self, "language_menu", None) is not None:
+            translator.bind_widget_tree(self.language_menu)
+        self._update_language_button_text()
+        self._update_language_menu_checks(translator.current_language)
+        translator.register_callback(self.on_language_changed)
+    
+    def _setup_auto_updater(self) -> None:
+        """Initialize and start the auto-updater"""
+        self.auto_updater = AutoUpdater(self)
+        self.auto_updater.update_available.connect(self._on_update_available)
+        self.auto_updater.start()
+    
+    def _on_update_available(self, update_info: Dict[str, Any]) -> None:
+        """Handle notification when an update is available"""
+        dialog = UpdateNotificationDialog(update_info, self)
+        result = dialog.exec()
+        
+        if result == QMessageBox.Yes:
+            # Open the download page in the default browser
+            import webbrowser
+            url = dialog.get_download_url()
+            if url:
+                webbrowser.open(url)
+        elif result == QMessageBox.Ignore:
+            # User chose to ignore this update
+            pass
+
+    def change_language(self, language_code: str) -> None:
+        translator.set_language(language_code)
+
+    def on_language_changed(self, language_code: str) -> None:
+        self._update_language_button_text()
+        self._update_language_menu_checks(language_code)
+        if hasattr(self, "status_bar") and self.status_bar:
+            if language_code == "vi":
+                message_key = "Language switched to Vietnamese"
+            else:
+                message_key = "Language switched to English"
+            self.status_bar.showMessage(tr(message_key), 3000)
+
     def setup_menu(self):
         """Setup menu bar"""
         menubar = self.menuBar()
@@ -2323,6 +2585,12 @@ class AutoBotGUI(QMainWindow):
         # Help menu
         help_menu = menubar.addMenu('Help')
         
+        check_updates_action = QAction('Check for Updates', self)
+        check_updates_action.triggered.connect(self.check_for_updates)
+        help_menu.addAction(check_updates_action)
+        
+        help_menu.addSeparator()
+        
         about_action = QAction('About', self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
@@ -2342,6 +2610,10 @@ class AutoBotGUI(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            # Stop auto-updater
+            if hasattr(self, "auto_updater"):
+                self.auto_updater.stop()
+            
             if hasattr(self, "utilities_tab") and self.utilities_tab:
                 self.utilities_tab.prepare_shutdown()
             if hasattr(self, "channels_tab") and self.channels_tab:
@@ -2357,14 +2629,17 @@ class AutoBotGUI(QMainWindow):
             if dialog.exec() == QDialog.Accepted:
                 if hasattr(self, 'channels_tab'):
                     self.channels_tab.refresh_channels()
-                self.status_bar.showMessage("New channel created successfully", 3000)
+                self.status_bar.showMessage(tr("New channel created successfully"), 3000)
         else:
-            QMessageBox.information(self, "Info", "Channel management components not available!")
+            QMessageBox.information(self, tr("Info"), tr("Channel management components not available!"))
     
     def import_configuration(self):
         """Import configuration from file"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Import Configuration", "", "JSON Files (*.json);;All Files (*)"
+            self,
+            tr("Import Configuration"),
+            "",
+            tr("JSON Files (*.json);;All Files (*)"),
         )
         if file_path:
             try:
@@ -2376,46 +2651,67 @@ class AutoBotGUI(QMainWindow):
                     # It's settings
                     errors = self.config_manager.validate_settings(config_data)
                     if errors:
-                        QMessageBox.warning(self, "Validation Error", 
-                                          f"Configuration has errors:\n" + "\n".join(errors))
+                        QMessageBox.warning(
+                            self,
+                            tr("Validation Error"),
+                            tr("Configuration has errors:") + "\n" + "\n".join(errors),
+                        )
                         return
                     
                     if self.config_manager.save_settings(config_data):
                         self.settings_tab.load_settings()
-                        QMessageBox.information(self, "Success", "Settings imported successfully!")
+                        QMessageBox.information(
+                            self,
+                            tr("Success"),
+                            tr("Settings imported successfully!"),
+                        )
                     else:
-                        QMessageBox.critical(self, "Error", "Failed to import settings!")
+                        QMessageBox.critical(self, tr("Error"), tr("Failed to import settings!"))
                 
                 elif "youtube_channel_id" in config_data:
                     # It's a channel config
                     errors = self.config_manager.validate_channel_config(config_data)
                     if errors:
-                        QMessageBox.warning(self, "Validation Error", 
-                                          f"Configuration has errors:\n" + "\n".join(errors))
+                        QMessageBox.warning(
+                            self,
+                            tr("Validation Error"),
+                            tr("Configuration has errors:") + "\n" + "\n".join(errors),
+                        )
                         return
                     
                     channel_id = config_data["youtube_channel_id"]
                     if self.config_manager.save_channel(channel_id, config_data, {}):
                         if hasattr(self, 'channels_tab'):
                             self.channels_tab.refresh_channels()
-                        QMessageBox.information(self, "Success", f"Channel {channel_id} imported successfully!")
+                        QMessageBox.information(
+                            self,
+                            tr("Success"),
+                            tr("Channel {channel_id} imported successfully!").format(channel_id=channel_id),
+                        )
                     else:
-                        QMessageBox.critical(self, "Error", "Failed to import channel!")
+                        QMessageBox.critical(self, tr("Error"), tr("Failed to import channel!"))
                 
                 else:
-                    QMessageBox.warning(self, "Invalid Format", 
-                                      "File doesn't appear to be a valid settings or channel configuration!")
+                    QMessageBox.warning(
+                        self,
+                        tr("Invalid Format"),
+                        tr("File doesn't appear to be a valid settings or channel configuration!"),
+                    )
                     
             except json.JSONDecodeError:
-                QMessageBox.critical(self, "Error", "Invalid JSON file!")
+                QMessageBox.critical(self, tr("Error"), tr("Invalid JSON file!"))
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to import configuration: {str(e)}")
+                QMessageBox.critical(
+                    self,
+                    tr("Error"),
+                    tr("Failed to import configuration: {error}").format(error=str(e)),
+                )
     
     def export_configuration(self):
         """Export configuration to file"""
         # Show dialog to choose what to export
         export_dialog = QDialog(self)
-        export_dialog.setWindowTitle("Export Configuration")
+        export_dialog.setWindowTitle(tr("Export Configuration"))
         export_dialog.setModal(True)
         
         layout = QVBoxLayout()
@@ -2439,9 +2735,10 @@ class AutoBotGUI(QMainWindow):
         
         if export_dialog.exec() == QDialog.Accepted:
             file_path, _ = QFileDialog.getSaveFileName(
-                self, "Export Configuration", 
+                self,
+                tr("Export Configuration"),
                 f"autobot_config_{time.strftime('%Y%m%d_%H%M%S')}.json",
-                "JSON Files (*.json)"
+                tr("JSON Files (*.json);;All Files (*)"),
             )
             
             if file_path:
@@ -2457,22 +2754,40 @@ class AutoBotGUI(QMainWindow):
                     with open(file_path, 'w', encoding='utf-8') as f:
                         json.dump(export_data, f, indent=2, ensure_ascii=False)
                     
-                    QMessageBox.information(self, "Success", f"Configuration exported to {file_path}")
+                    QMessageBox.information(
+                        self,
+                        tr("Success"),
+                        tr("Configuration exported to {path}").format(path=file_path),
+                    )
                     
                 except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to export configuration: {str(e)}")
+                    QMessageBox.critical(
+                        self,
+                        tr("Error"),
+                        tr("Failed to export configuration: {error}").format(error=str(e)),
+                    )
+    
+    def check_for_updates(self):
+        """Manually check for updates"""
+        if hasattr(self, "auto_updater"):
+            self.auto_updater.check_now()
+            if hasattr(self, "status_bar"):
+                self.status_bar.showMessage(tr("Checking for updates..."), 3000)
     
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(
-            self, "About AutoBot GUI",
-            "AutoBot GUI v1.0\n\n"
-            "A graphical interface for managing YouTube to TikTok automation.\n\n"
-            "Features:\n"
-            "• Configure global settings\n"
-            "• Manage multiple channels\n"
-            "• Monitor channel automation\n\n"
-            "Built with PySide6"
+            self,
+            tr("About AutoBot GUI"),
+            tr(
+                "AutoBot GUI v1.0\n\n"
+                "A graphical interface for managing YouTube to TikTok automation.\n\n"
+                "Features:\n"
+                "• Configure global settings\n"
+                "• Manage multiple channels\n"
+                "• Monitor channel automation\n\n"
+                "Built with PySide6"
+            ),
         )
 
 

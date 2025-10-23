@@ -26,9 +26,6 @@ def test_imports():
         from gui_channels import ChannelsTab
         print("✓ ChannelsTab import OK")
         
-        from gui_pipeline import PipelineControlTab
-        print("✓ PipelineControlTab import OK")
-        
         print("\n🎉 All imports successful!")
         return True
         

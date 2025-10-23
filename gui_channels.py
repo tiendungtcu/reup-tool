@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
 from PySide6.QtGui import QIcon, QFont, QPixmap, QAction
 
+from localization import translator, tr
+
 if TYPE_CHECKING:
     from gui_main import ConfigManager
 else:
@@ -50,7 +52,7 @@ class ChannelPipelineWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.progress.emit(self.channel_id, "Preparing pipeline environment...")
+            self.progress.emit(self.channel_id, tr("Preparing pipeline environment..."))
             settings = self.config_manager.load_settings()
             autobot.APP_CONFIGS = settings
 
@@ -59,7 +61,7 @@ class ChannelPipelineWorker(QThread):
 
             channel_data = channels.get(self.channel_id)
             if not channel_data:
-                self.finished.emit(self.channel_id, False, "Channel configuration not found")
+                self.finished.emit(self.channel_id, False, tr("Channel configuration not found"))
                 return
 
             channel_config = channel_data['config']
@@ -72,42 +74,53 @@ class ChannelPipelineWorker(QThread):
             if self.video_url:
                 manual_video = self._create_video_from_url(self.video_url, channel_config)
                 if not manual_video:
-                    self.finished.emit(self.channel_id, False, "Failed to resolve video details from URL")
+                    self.finished.emit(
+                        self.channel_id,
+                        False,
+                        tr("Failed to resolve video details from URL"),
+                    )
                     return
 
             if not pipeline_steps.get("scan", True):
                 if not manual_video:
-                    self.finished.emit(self.channel_id, False, "Video URL required when scan step is disabled")
+                    self.finished.emit(
+                        self.channel_id,
+                        False,
+                        tr("Video URL required when scan step is disabled"),
+                    )
                     return
 
                 success = self._process_video(manual_video, pipeline_steps)
                 if self._stop_requested.is_set():
-                    self.finished.emit(self.channel_id, False, "Pipeline cancelled")
+                    self.finished.emit(self.channel_id, False, tr("Pipeline cancelled"))
                 elif success:
-                    self.finished.emit(self.channel_id, True, "Pipeline completed successfully")
+                    self.finished.emit(self.channel_id, True, tr("Pipeline completed successfully"))
                 else:
-                    self.finished.emit(self.channel_id, False, "Pipeline finished with errors")
+                    self.finished.emit(self.channel_id, False, tr("Pipeline finished with errors"))
                 return
 
             if manual_video:
                 success = self._process_video(manual_video, pipeline_steps)
                 if self._stop_requested.is_set():
-                    self.finished.emit(self.channel_id, True, "Stopped by user")
+                    self.finished.emit(self.channel_id, True, tr("Stopped by user"))
                     return
                 if not success:
-                    self.finished.emit(self.channel_id, False, "Pipeline finished with errors")
+                    self.finished.emit(self.channel_id, False, tr("Pipeline finished with errors"))
                     return
 
             self.progress.emit(
                 self.channel_id,
-                f"Scanning every {scan_interval}s for new videos...",
+                tr("Scanning every {seconds}s for new videos...").format(seconds=scan_interval),
             )
 
             while not self._stop_requested.is_set():
                 try:
                     video = autobot.check_new_video(self.channel_id)
                 except Exception as err:
-                    self.progress.emit(self.channel_id, f"Error checking videos: {err}")
+                    self.progress.emit(
+                        self.channel_id,
+                        tr("Error checking videos: {error}").format(error=err),
+                    )
                     if self._wait_with_stop(scan_interval):
                         break
                     continue
@@ -120,24 +133,28 @@ class ChannelPipelineWorker(QThread):
                     if not success and not self._stop_requested.is_set():
                         self.progress.emit(
                             self.channel_id,
-                            "⚠ Pipeline finished with errors; waiting for next scan",
+                            tr("⚠ Pipeline finished with errors; waiting for next scan"),
                         )
                 else:
                     self.progress.emit(
                         self.channel_id,
-                        f"No new videos. Next scan in {scan_interval}s",
+                        tr("No new videos. Next scan in {seconds}s").format(seconds=scan_interval),
                     )
 
                 if self._wait_with_stop(scan_interval):
                     break
 
             if self._stop_requested.is_set():
-                self.finished.emit(self.channel_id, True, "Stopped by user")
+                self.finished.emit(self.channel_id, True, tr("Stopped by user"))
             else:
-                self.finished.emit(self.channel_id, True, "Scanner stopped")
+                self.finished.emit(self.channel_id, True, tr("Scanner stopped"))
 
         except Exception as exc:
-            self.finished.emit(self.channel_id, False, f"Error: {exc}")
+            self.finished.emit(
+                self.channel_id,
+                False,
+                tr("Error: {error}").format(error=exc),
+            )
 
     def _wait_with_stop(self, seconds: int) -> bool:
         seconds = max(0, int(seconds))
@@ -150,7 +167,10 @@ class ChannelPipelineWorker(QThread):
             return False
 
         video_title = getattr(video, 'title', 'Unknown title')
-        self.progress.emit(self.channel_id, f"Processing video: {video_title}")
+        self.progress.emit(
+            self.channel_id,
+            tr("Processing video: {title}").format(title=video_title),
+        )
 
         try:
             success = autobot.process_video_pipeline(
@@ -166,7 +186,7 @@ class ChannelPipelineWorker(QThread):
             success = autobot.process_video_pipeline(self.channel_id, video)
 
         if not success and not self._stop_requested.is_set():
-            self.progress.emit(self.channel_id, "⚠ Pipeline finished with errors")
+            self.progress.emit(self.channel_id, tr("⚠ Pipeline finished with errors"))
 
         return bool(success)
 
@@ -211,7 +231,9 @@ class ChannelDialog(QDialog):
         self.channel_id = channel_id
         self.is_editing = channel_id is not None
         self._updating_steps = False
-        self.pipeline_checks: Dict[str, QCheckBox] = {}
+        self._syncing_proxy_text = False
+        self.cookies_proxy_edit = None  # type: Optional[QLineEdit]
+        self.pipeline_checks = {}  # type: Dict[str, QCheckBox]
         self.setup_ui()
         
         if self.is_editing:
@@ -231,27 +253,27 @@ class ChannelDialog(QDialog):
         
         # Basic Settings Tab
         basic_tab = self.create_basic_settings_tab()
-        tab_widget.addTab(basic_tab, "Basic Settings")
+        tab_widget.addTab(basic_tab, tr("Basic Settings"))
         
         # YouTube Settings Tab
         youtube_tab = self.create_youtube_settings_tab()
-        tab_widget.addTab(youtube_tab, "YouTube API")
+        tab_widget.addTab(youtube_tab, tr("YouTube API"))
         
         # TikTok Settings Tab
         tiktok_tab = self.create_tiktok_settings_tab()
-        tab_widget.addTab(tiktok_tab, "TikTok Settings")
+        tab_widget.addTab(tiktok_tab, tr("TikTok Settings"))
         
         # Pipeline Settings Tab
         pipeline_tab = self.create_pipeline_settings_tab()
-        tab_widget.addTab(pipeline_tab, "Pipeline")
+        tab_widget.addTab(pipeline_tab, tr("Pipeline"))
 
         # Advanced Settings Tab
         advanced_tab = self.create_advanced_settings_tab()
-        tab_widget.addTab(advanced_tab, "Advanced")
+        tab_widget.addTab(advanced_tab, tr("Advanced"))
         
         # Cookies Tab
         cookies_tab = self.create_cookies_tab()
-        tab_widget.addTab(cookies_tab, "Cookies")
+        tab_widget.addTab(cookies_tab, tr("Cookies"))
         
         layout.addWidget(tab_widget)
         
@@ -260,169 +282,190 @@ class ChannelDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        
+
         self.setLayout(layout)
+
+        translator.bind_widget_tree(self)
     
     def create_basic_settings_tab(self):
         widget = QWidget()
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        
+
         self.channel_id_edit = QLineEdit()
         self.channel_id_edit.setPlaceholderText("UC...")
         self._prepare_line_edit(self.channel_id_edit)
         if self.is_editing:
             self.channel_id_edit.setReadOnly(True)
-        layout.addRow("YouTube Channel ID:", self.channel_id_edit)
-        
+        layout.addRow(tr("YouTube Channel ID:"), self.channel_id_edit)
+
         self.channel_name_edit = QLineEdit()
         self.channel_name_edit.setPlaceholderText("Channel display name")
         self._prepare_line_edit(self.channel_name_edit)
-        layout.addRow("Channel Name:", self.channel_name_edit)
-        
+        layout.addRow(tr("Channel Name:"), self.channel_name_edit)
+
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("TikTok username")
         self._prepare_line_edit(self.username_edit)
-        layout.addRow("TikTok Username:", self.username_edit)
-        
+        layout.addRow(tr("TikTok Username:"), self.username_edit)
+
         self.telegram_edit = QLineEdit()
         self.telegram_edit.setPlaceholderText("chat_id|bot_token (optional)")
         self._prepare_line_edit(self.telegram_edit)
-        layout.addRow("Telegram Override:", self.telegram_edit)
-        
+        layout.addRow(tr("Telegram Override:"), self.telegram_edit)
+
         widget.setLayout(layout)
         return widget
-    
+
     def create_youtube_settings_tab(self):
         widget = QWidget()
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        
+
         self.api_key_edit = QTextEdit()
         self.api_key_edit.setMaximumHeight(100)
         self.api_key_edit.setPlaceholderText("Enter API keys separated by semicolons (;)")
         self._prepare_text_edit(self.api_key_edit)
-        layout.addRow("YouTube API Keys:", self.api_key_edit)
-        
+        layout.addRow(tr("YouTube API Keys:"), self.api_key_edit)
+
         self.api_type_combo = QComboBox()
-        self.api_type_combo.addItems(["activities", "playlistItems"])
-        layout.addRow("API Type:", self.api_type_combo)
-        
+        for value in ["activities", "playlistItems"]:
+            self.api_type_combo.addItem(value, value)
+        layout.addRow(tr("API Type:"), self.api_type_combo)
+
         self.scan_method_combo = QComboBox()
-        self.scan_method_combo.addItems(["sequence", "parallel"])
-        layout.addRow("API Scan Method:", self.scan_method_combo)
-        
+        for value in ["sequence", "parallel"]:
+            self.scan_method_combo.addItem(value, value)
+        layout.addRow(tr("API Scan Method:"), self.scan_method_combo)
+
         self.detect_video_combo = QComboBox()
-        self.detect_video_combo.addItems(["websub", "api", "both"])
+        for value in ["websub", "api", "both"]:
+            self.detect_video_combo.addItem(value, value)
         self.detect_video_combo.currentTextChanged.connect(self.on_detect_video_changed)
-        layout.addRow("Video Detection:", self.detect_video_combo)
-        
+        layout.addRow(tr("Video Detection:"), self.detect_video_combo)
+
         self.scan_interval_spin = QSpinBox()
         self.scan_interval_spin.setRange(1, 3600)
         self.scan_interval_spin.setValue(5)
-        self.scan_interval_spin.setSuffix(" seconds")
-        layout.addRow("Scan Interval:", self.scan_interval_spin)
-        
+        self.scan_interval_spin.setSuffix(f" {tr('seconds')}")
+        layout.addRow(tr("Scan Interval:"), self.scan_interval_spin)
+
         self.is_new_second_spin = QSpinBox()
         self.is_new_second_spin.setRange(60, 86400)
         self.is_new_second_spin.setValue(36000000)
-        self.is_new_second_spin.setSuffix(" seconds")
-        layout.addRow("New Video Threshold:", self.is_new_second_spin)
-        
+        self.is_new_second_spin.setSuffix(f" {tr('seconds')}")
+        layout.addRow(tr("New Video Threshold:"), self.is_new_second_spin)
+
         widget.setLayout(layout)
         return widget
-    
+
     def create_tiktok_settings_tab(self):
         widget = QWidget()
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        
+
         self.upload_method_combo = QComboBox()
-        self.upload_method_combo.addItems(["api", "browser"])
-        layout.addRow("Upload Method:", self.upload_method_combo)
-        
+        for value in ["api", "browser"]:
+            self.upload_method_combo.addItem(value, value)
+        layout.addRow(tr("Upload Method:"), self.upload_method_combo)
+
         self.region_combo = QComboBox()
-        self.region_combo.addItems([
-            "ap-northeast-3", "ap-southeast-1", "us-east-1", "eu-west-1"
-        ])
-        layout.addRow("Region:", self.region_combo)
-        
+        for value in ["ap-northeast-3", "ap-southeast-1", "us-east-1", "eu-west-1"]:
+            self.region_combo.addItem(value, value)
+        layout.addRow(tr("Region:"), self.region_combo)
+
         self.video_format_edit = QLineEdit()
         self.video_format_edit.setText("18")
         self.video_format_edit.setPlaceholderText("YouTube video format")
         self._prepare_line_edit(self.video_format_edit)
-        layout.addRow("Video Format:", self.video_format_edit)
-        
+        layout.addRow(tr("Video Format:"), self.video_format_edit)
+
         self.render_method_combo = QComboBox()
-        self.render_method_combo.addItems(["repeat", "slow"])
-        layout.addRow("Render Method:", self.render_method_combo)
-        
+        for value in ["repeat", "slow"]:
+            self.render_method_combo.addItem(value, value)
+        layout.addRow(tr("Render Method:"), self.render_method_combo)
+
         self.is_human_check = QCheckBox()
-        layout.addRow("Human-like Behavior:", self.is_human_check)
-        
+        layout.addRow(tr("Human-like Behavior:"), self.is_human_check)
+
         widget.setLayout(layout)
         return widget
-    
+
     def create_advanced_settings_tab(self):
         widget = QWidget()
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        
+
         self.proxy_edit = QLineEdit()
         self.proxy_edit.setPlaceholderText("host:port:username:password")
         self._prepare_line_edit(self.proxy_edit)
-        layout.addRow("Proxy:", self.proxy_edit)
-        
+        self.proxy_edit.textChanged.connect(self._on_advanced_proxy_changed)
+        layout.addRow(tr("Proxy:"), self.proxy_edit)
+
         self.user_agent_edit = QLineEdit()
         self.user_agent_edit.setText("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         self._prepare_line_edit(self.user_agent_edit)
-        layout.addRow("User Agent:", self.user_agent_edit)
-        
+        layout.addRow(tr("User Agent:"), self.user_agent_edit)
+
         self.viewport_edit = QLineEdit()
         self.viewport_edit.setText("1280x720")
         self.viewport_edit.setPlaceholderText("widthxheight")
         self._prepare_line_edit(self.viewport_edit)
-        layout.addRow("Viewport Size:", self.viewport_edit)
-        
+        layout.addRow(tr("Viewport Size:"), self.viewport_edit)
+
         widget.setLayout(layout)
         return widget
     
     def create_cookies_tab(self):
         widget = QWidget()
         layout = QVBoxLayout()
-        
+
         # Instructions
         instructions = QLabel(
-            "Paste TikTok cookies in JSON format. You can export cookies from browser extensions.\n"
-            "The format should match the structure used by the application."
+            tr("Paste TikTok cookies in JSON format. You can export cookies from browser extensions.\n"
+            "The format should match the structure used by the application. Set an optional upload proxy below.")
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
-        
+
         # Cookies text area
         self.cookies_edit = QTextEdit()
         self.cookies_edit.setPlaceholderText('{"url": "https://www.tiktok.com", "cookies": [...]}')
         self._prepare_text_edit(self.cookies_edit)
+        self.cookies_edit.textChanged.connect(self._on_cookies_text_changed)
         layout.addWidget(self.cookies_edit)
-        
+
+        proxy_form = QFormLayout()
+        proxy_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self.cookies_proxy_edit = QLineEdit()
+        self.cookies_proxy_edit.setPlaceholderText("host:port or host:port:username:password")
+        self._prepare_line_edit(self.cookies_proxy_edit)
+        self.cookies_proxy_edit.textChanged.connect(self._on_cookies_proxy_changed)
+        proxy_form.addRow(tr("Upload Proxy:"), self.cookies_proxy_edit)
+        layout.addLayout(proxy_form)
+
+        # Align proxy field with current advanced tab value
+        self._set_proxy_text(self.proxy_edit.text())
+
         # Buttons for cookie management
         button_layout = QHBoxLayout()
-        
-        load_btn = QPushButton("Load from File")
+
+        load_btn = QPushButton(tr("Load from File"))
         load_btn.clicked.connect(self.load_cookies_from_file)
         button_layout.addWidget(load_btn)
-        
-        save_btn = QPushButton("Save to File")
+
+        save_btn = QPushButton(tr("Save to File"))
         save_btn.clicked.connect(self.save_cookies_to_file)
         button_layout.addWidget(save_btn)
-        
-        validate_btn = QPushButton("Validate")
+
+        validate_btn = QPushButton(tr("Validate"))
         validate_btn.clicked.connect(self.validate_cookies)
         button_layout.addWidget(validate_btn)
-        
+
         button_layout.addStretch()
         layout.addLayout(button_layout)
-        
+
         widget.setLayout(layout)
         return widget
 
@@ -431,20 +474,20 @@ class ChannelDialog(QDialog):
         layout = QVBoxLayout()
 
         description = QLabel(
-            "Choose which stages of the automation pipeline should run for this channel.\n"
-            "Steps later in the pipeline require the previous ones to remain enabled."
+            tr("Choose which stages of the automation pipeline should run for this channel.\n"
+            "Steps later in the pipeline require the previous ones to remain enabled.")
         )
         description.setWordWrap(True)
         layout.addWidget(description)
 
-        steps_group = QGroupBox("Pipeline Steps")
+        steps_group = QGroupBox(tr("Pipeline Steps"))
         steps_layout = QVBoxLayout()
 
         step_labels = {
-            "scan": "Scan for new YouTube videos",
-            "download": "Download detected videos",
-            "render": "Render downloaded videos",
-            "upload": "Upload rendered videos to TikTok",
+            "scan": tr("Scan for new YouTube videos"),
+            "download": tr("Download detected videos"),
+            "render": tr("Render downloaded videos"),
+            "upload": tr("Upload rendered videos to TikTok"),
         }
 
         for step, label in step_labels.items():
@@ -490,19 +533,31 @@ class ChannelDialog(QDialog):
             self.is_human_check.setChecked(bool(config.get('is_human', 1)))
             
             # Advanced settings
-            self.proxy_edit.setText(config.get('proxy', ''))
+            proxy_value = str(config.get('proxy', '') or '').strip()
+            self._set_proxy_text(proxy_value)
             self.user_agent_edit.setText(config.get('user_agent', ''))
             self.viewport_edit.setText(config.get('view_port', '1280x720'))
             
             # Cookies
             if cookies:
                 self.cookies_edit.setPlainText(json.dumps(cookies, indent=2))
+                if isinstance(cookies, dict):
+                    cookies_proxy = str(cookies.get('proxy', '') or '').strip()
+                    if cookies_proxy:
+                        self._set_proxy_text(cookies_proxy)
 
             # Pipeline steps
             self.set_pipeline_steps(config.get('pipeline_steps', {}))
     
     def get_channel_data(self):
         """Get channel data from UI"""
+        proxy_value = ""
+        if self.cookies_proxy_edit is not None:
+            proxy_value = self.cookies_proxy_edit.text().strip()
+        else:
+            proxy_value = self.proxy_edit.text().strip()
+        self._set_proxy_text(proxy_value)
+
         config = {
             'youtube_channel_id': self.channel_id_edit.text().strip(),
             'channel_name': self.channel_name_edit.text().strip(),
@@ -519,7 +574,7 @@ class ChannelDialog(QDialog):
             'video_format': self.video_format_edit.text().strip(),
             'render_video_method': self.render_method_combo.currentText(),
             'is_human': 1 if self.is_human_check.isChecked() else 0,
-            'proxy': self.proxy_edit.text().strip(),
+            'proxy': proxy_value,
             'user_agent': self.user_agent_edit.text().strip(),
             'view_port': self.viewport_edit.text().strip(),
             'pipeline_steps': self.get_pipeline_steps()
@@ -531,6 +586,11 @@ class ChannelDialog(QDialog):
         if cookies_text:
             try:
                 cookies = json.loads(cookies_text)
+                if isinstance(cookies, dict):
+                    if proxy_value:
+                        cookies['proxy'] = proxy_value
+                    elif 'proxy' in cookies:
+                        del cookies['proxy']
             except json.JSONDecodeError:
                 pass
         
@@ -594,7 +654,7 @@ class ChannelDialog(QDialog):
                 if not scan_checkbox.isChecked():
                     scan_checkbox.setChecked(True)
                 scan_checkbox.setEnabled(False)
-                scan_checkbox.setToolTip("Scan is required when using WebSub detection modes.")
+                scan_checkbox.setToolTip(tr("Scan is required when using WebSub detection modes."))
             else:
                 scan_checkbox.setEnabled(True)
                 scan_checkbox.setToolTip("")
@@ -608,55 +668,170 @@ class ChannelDialog(QDialog):
     def _prepare_text_edit(self, widget: QTextEdit):
         widget.setMinimumWidth(320)
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def _set_proxy_text(self, text: str):
+        if self._syncing_proxy_text or not hasattr(self, "proxy_edit"):
+            return
+        sanitized = (text or "").strip()
+        self._syncing_proxy_text = True
+        try:
+            current_proxy = self.proxy_edit.text() if self.proxy_edit else ""
+            if sanitized != current_proxy:
+                self.proxy_edit.setText(sanitized)
+            if self.cookies_proxy_edit is not None and sanitized != self.cookies_proxy_edit.text():
+                self.cookies_proxy_edit.setText(sanitized)
+        finally:
+            self._syncing_proxy_text = False
+
+    def _on_advanced_proxy_changed(self, text: str):
+        self._set_proxy_text(text)
+
+    def _on_cookies_proxy_changed(self, text: str):
+        self._set_proxy_text(text)
+
+    def _on_cookies_text_changed(self):
+        if self.cookies_proxy_edit is None:
+            return
+        text = self.cookies_edit.toPlainText().strip()
+        if not text:
+            return
+        try:
+            data = json.loads(text)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            proxy_value = str(data.get("proxy", "") or "").strip()
+            if proxy_value:
+                self._set_proxy_text(proxy_value)
+
+    @staticmethod
+    def _is_valid_proxy_format(proxy: str) -> bool:
+        if not proxy:
+            return True
+        parts = [part.strip() for part in proxy.split(":")]
+        if len(parts) not in (2, 4):
+            return False
+        host, port = parts[0], parts[1]
+        if not host or not port.isdigit():
+            return False
+        port_value = int(port)
+        if port_value < 1 or port_value > 65535:
+            return False
+        if len(parts) == 4:
+            username, password = parts[2], parts[3]
+            if not username or not password:
+                return False
+        return True
     
     def load_cookies_from_file(self):
         """Load cookies from JSON file"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Load Cookies", "", "JSON Files (*.json)"
+            self,
+            tr("Load Cookies"),
+            "",
+            tr("JSON Files (*.json);;All Files (*)"),
         )
         if file_path:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     cookies = json.load(f)
                 self.cookies_edit.setPlainText(json.dumps(cookies, indent=2))
-                QMessageBox.information(self, "Success", "Cookies loaded successfully!")
+                if isinstance(cookies, dict):
+                    self._set_proxy_text(cookies.get("proxy", ""))
+                QMessageBox.information(
+                    self,
+                    tr("Success"),
+                    tr("Cookies loaded successfully!"),
+                )
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load cookies: {str(e)}")
+                QMessageBox.critical(
+                    self,
+                    tr("Error"),
+                    tr("Failed to load cookies: {error}").format(error=str(e)),
+                )
     
     def save_cookies_to_file(self):
         """Save cookies to JSON file"""
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Cookies", "", "JSON Files (*.json)"
+            self,
+            tr("Save Cookies"),
+            "",
+            tr("JSON Files (*.json);;All Files (*)"),
         )
         if file_path:
             try:
                 cookies_text = self.cookies_edit.toPlainText().strip()
+                proxy_text = self.cookies_proxy_edit.text().strip() if self.cookies_proxy_edit else ""
+                if proxy_text and not self._is_valid_proxy_format(proxy_text):
+                    QMessageBox.warning(
+                        self,
+                        tr("Warning"),
+                        tr("Proxy format should be host:port or host:port:username:password"),
+                    )
+                    return
                 if cookies_text:
                     cookies = json.loads(cookies_text)
+                    if isinstance(cookies, dict):
+                        if proxy_text:
+                            cookies["proxy"] = proxy_text
+                        elif "proxy" in cookies:
+                            del cookies["proxy"]
                     with open(file_path, 'w', encoding='utf-8') as f:
                         json.dump(cookies, f, indent=2)
-                    QMessageBox.information(self, "Success", "Cookies saved successfully!")
+                    QMessageBox.information(
+                        self,
+                        tr("Success"),
+                        tr("Cookies saved successfully!"),
+                    )
                 else:
-                    QMessageBox.warning(self, "Warning", "No cookies to save!")
+                    QMessageBox.warning(
+                        self,
+                        tr("Warning"),
+                        tr("No cookies to save!"),
+                    )
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to save cookies: {str(e)}")
+                QMessageBox.critical(
+                    self,
+                    tr("Error"),
+                    tr("Failed to save cookies: {error}").format(error=str(e)),
+                )
     
     def validate_cookies(self):
         """Validate cookies JSON format"""
         cookies_text = self.cookies_edit.toPlainText().strip()
         if not cookies_text:
-            QMessageBox.warning(self, "Warning", "No cookies to validate!")
+            QMessageBox.warning(self, tr("Warning"), tr("No cookies to validate!"))
             return
         
         try:
             cookies = json.loads(cookies_text)
+            proxy_text = self.cookies_proxy_edit.text().strip() if self.cookies_proxy_edit else ""
+            if not proxy_text and isinstance(cookies, dict):
+                proxy_text = str(cookies.get("proxy", "") or "").strip()
+                if proxy_text:
+                    self._set_proxy_text(proxy_text)
+            if proxy_text and not self._is_valid_proxy_format(proxy_text):
+                QMessageBox.warning(
+                    self,
+                    "Warning",
+                    "Proxy format should be host:port or host:port:username:password",
+                )
+                return
             # Basic validation
             if isinstance(cookies, dict) and 'cookies' in cookies:
-                QMessageBox.information(self, "Success", "Cookies format is valid!")
+                QMessageBox.information(self, tr("Success"), tr("Cookies format is valid!"))
             else:
-                QMessageBox.warning(self, "Warning", "Cookies format may be incorrect. Expected structure with 'cookies' key.")
+                QMessageBox.warning(
+                    self,
+                    tr("Warning"),
+                    tr("Cookies format may be incorrect. Expected structure with 'cookies' key."),
+                )
         except json.JSONDecodeError as e:
-            QMessageBox.critical(self, "Error", f"Invalid JSON format: {str(e)}")
+            QMessageBox.critical(
+                self,
+                tr("Error"),
+                tr("Invalid JSON format: {error}").format(error=str(e)),
+            )
     
     def accept(self):
         """Validate and accept dialog"""
@@ -664,11 +839,19 @@ class ChannelDialog(QDialog):
         
         # Basic validation
         if not config['youtube_channel_id']:
-            QMessageBox.warning(self, "Validation Error", "YouTube Channel ID is required!")
+            QMessageBox.warning(
+                self,
+                tr("Validation Error"),
+                tr("YouTube Channel ID is required!"),
+            )
             return
         
         if not config['youtube_api_key']:
-            QMessageBox.warning(self, "Validation Error", "At least one YouTube API key is required!")
+            QMessageBox.warning(
+                self,
+                tr("Validation Error"),
+                tr("At least one YouTube API key is required!"),
+            )
             return
         
         # Save channel
@@ -676,7 +859,7 @@ class ChannelDialog(QDialog):
         if self.config_manager.save_channel(channel_id, config, cookies):
             super().accept()
         else:
-            QMessageBox.critical(self, "Error", "Failed to save channel!")
+            QMessageBox.critical(self, tr("Error"), tr("Failed to save channel!"))
 
 
 class ChannelsTab(QWidget):
@@ -693,6 +876,7 @@ class ChannelsTab(QWidget):
         self._channel_cache: Dict[str, Any] = {}
         self.setup_ui()
         self.refresh_channels()
+        translator.register_callback(self._on_language_changed)
     
     def setup_ui(self):
         layout = QVBoxLayout()
@@ -739,7 +923,7 @@ class ChannelsTab(QWidget):
         self.column_definitions = self._build_column_definitions()
         self.channels_table.setColumnCount(len(self.column_definitions))
         self.channels_table.setHorizontalHeaderLabels([
-            column["label"] for column in self.column_definitions
+            tr(column["label"]) for column in self.column_definitions
         ])
         for index, column in enumerate(self.column_definitions):
             if not column.get("default_visible", True):
@@ -766,16 +950,19 @@ class ChannelsTab(QWidget):
         layout.addLayout(toolbar_layout)
         layout.addWidget(self.channels_table)
         self.setLayout(layout)
+
+        translator.bind_widget_tree(self)
+        self._apply_localized_column_labels()
     
     def _create_column_menu(self):
         self.show_columns_menu = QMenu(self)
-        show_all_action = QAction("Show All Columns", self)
-        show_all_action.triggered.connect(self._show_all_columns)
-        self.show_columns_menu.addAction(show_all_action)
+        self.show_all_columns_action = QAction("Show All Columns", self)
+        self.show_all_columns_action.triggered.connect(self._show_all_columns)
+        self.show_columns_menu.addAction(self.show_all_columns_action)
 
-        restore_defaults_action = QAction("Restore Default Columns", self)
-        restore_defaults_action.triggered.connect(self._restore_default_columns)
-        self.show_columns_menu.addAction(restore_defaults_action)
+        self.restore_columns_action = QAction("Restore Default Columns", self)
+        self.restore_columns_action.triggered.connect(self._restore_default_columns)
+        self.show_columns_menu.addAction(self.restore_columns_action)
 
         self.show_columns_menu.addSeparator()
         self.column_actions.clear()
@@ -787,6 +974,29 @@ class ChannelsTab(QWidget):
             self.show_columns_menu.addAction(action)
             self.column_actions.append(action)
         self.show_columns_btn.setMenu(self.show_columns_menu)
+
+    def _apply_localized_column_labels(self) -> None:
+        for index, column in enumerate(self.column_definitions):
+            header_item = self.channels_table.horizontalHeaderItem(index)
+            if header_item is not None:
+                header_item.setText(tr(column["label"]))
+            if index < len(self.column_actions):
+                try:
+                    self.column_actions[index].setText(tr(column["label"]))
+                except RuntimeError:
+                    continue
+
+        if hasattr(self, "show_all_columns_action"):
+            self.show_all_columns_action.setText(tr("Show All Columns"))
+        if hasattr(self, "restore_columns_action"):
+            self.restore_columns_action.setText(tr("Restore Default Columns"))
+
+    def _on_language_changed(self, _language: str) -> None:
+        self._apply_localized_column_labels()
+        self.scan_interval_spin.setSuffix(f" {tr('seconds')}")
+        self.is_new_second_spin.setSuffix(f" {tr('seconds')}")
+        self.last_status_message.clear()
+        self.refresh_channels()
 
     def _show_all_columns(self) -> None:
         for index in range(len(self.column_definitions)):
@@ -829,7 +1039,7 @@ class ChannelsTab(QWidget):
 
     @staticmethod
     def _format_bool(value: Any) -> str:
-        return "Yes" if bool(value) else "No"
+        return tr("Yes") if bool(value) else tr("No")
 
     @staticmethod
     def _format_api_keys(value: Any) -> str:
@@ -882,8 +1092,8 @@ class ChannelsTab(QWidget):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
 
-        start_btn = QPushButton("Start")
-        stop_btn = QPushButton("Stop")
+        start_btn = QPushButton(tr("Start"))
+        stop_btn = QPushButton(tr("Stop"))
 
         start_btn.setEnabled(not is_running)
         stop_btn.setEnabled(is_running)
@@ -955,8 +1165,8 @@ class ChannelsTab(QWidget):
             pipeline_steps = autobot._sanitize_pipeline_steps(config.get("pipeline_steps"))
             has_cookies = bool(data.get('cookies'))
             is_running = channel_id in self.pipeline_workers
-            base_status = "✓ Ready" if has_cookies else "⚠ No Cookies"
-            default_status = "⏱ Running..." if is_running else base_status
+            base_status = tr("✓ Ready") if has_cookies else tr("⚠ No Cookies")
+            default_status = tr("⏱ Running...") if is_running else base_status
             status_text = self.last_status_message.get(channel_id, default_status)
             self.last_status_message.setdefault(channel_id, status_text)
 
@@ -1027,7 +1237,7 @@ class ChannelsTab(QWidget):
 
             if not steps.get("scan", True):
                 skipped_manual.append(channel_id)
-                self.update_channel_status(channel_id, "⚠ Requires manual video URL")
+                self.update_channel_status(channel_id, tr("⚠ Requires manual video URL"))
                 continue
 
             self.start_channel_pipeline(channel_id)
@@ -1035,8 +1245,10 @@ class ChannelsTab(QWidget):
         if skipped_manual:
             QMessageBox.information(
                 self,
-                "Manual Start Required",
-                "Skipped channels requiring manual video URL:\n" + "\n".join(skipped_manual),
+                tr("Manual Start Required"),
+                tr("Skipped channels requiring manual video URL:\n{channels}").format(
+                    channels="\n".join(skipped_manual)
+                ),
             )
 
         self.update_bulk_controls()
@@ -1051,13 +1263,21 @@ class ChannelsTab(QWidget):
 
     def start_channel_pipeline(self, channel_id: str):
         if channel_id in self.pipeline_workers:
-            QMessageBox.information(self, "Pipeline Running", f"Channel {channel_id} is already running")
+            QMessageBox.information(
+                self,
+                tr("Pipeline Running"),
+                tr("Channel {channel_id} is already running").format(channel_id=channel_id),
+            )
             return
 
         channels = self.config_manager.get_channels()
         channel_data = channels.get(channel_id)
         if not channel_data:
-            QMessageBox.warning(self, "Missing Configuration", f"Could not find configuration for {channel_id}")
+            QMessageBox.warning(
+                self,
+                tr("Missing Configuration"),
+                tr("Could not find configuration for {channel_id}").format(channel_id=channel_id),
+            )
             return
 
         pipeline_steps = autobot._sanitize_pipeline_steps(
@@ -1068,8 +1288,8 @@ class ChannelsTab(QWidget):
         if not pipeline_steps.get("scan", True):
             video_url, ok = QInputDialog.getText(
                 self,
-                "Manual Video URL",
-                "Scan step is disabled. Provide a YouTube video URL to process:"
+                tr("Manual Video URL"),
+                tr("Scan step is disabled. Provide a YouTube video URL to process:"),
             )
             if not ok or not video_url.strip():
                 return
@@ -1078,8 +1298,8 @@ class ChannelsTab(QWidget):
         if pipeline_steps.get("upload", True) and not channel_data['cookies']:
             reply = QMessageBox.question(
                 self,
-                "Missing Cookies",
-                "This channel has no cookies configured. Continue anyway?",
+                tr("Missing Cookies"),
+                tr("This channel has no cookies configured. Continue anyway?"),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
@@ -1097,7 +1317,7 @@ class ChannelsTab(QWidget):
         if channel_id in self.stop_buttons:
             self.stop_buttons[channel_id].setEnabled(True)
 
-        self.update_channel_status(channel_id, "Starting pipeline...")
+        self.update_channel_status(channel_id, tr("Starting pipeline..."))
         worker.start()
         self.update_bulk_controls()
 
@@ -1108,7 +1328,7 @@ class ChannelsTab(QWidget):
         worker.request_stop()
         if channel_id in self.stop_buttons:
             self.stop_buttons[channel_id].setEnabled(False)
-        self.update_channel_status(channel_id, "Stopping pipeline...")
+        self.update_channel_status(channel_id, tr("Stopping pipeline..."))
         self.update_bulk_controls()
 
     def on_worker_progress(self, channel_id: str, message: str):
@@ -1125,7 +1345,11 @@ class ChannelsTab(QWidget):
             self.stop_buttons[channel_id].setEnabled(False)
 
         status_prefix = "✅" if success else "⚠"
-        final_message = f"{status_prefix} {message}" if message else ("✅ Done" if success else "⚠ Failed")
+        final_message = (
+            f"{status_prefix} {message}"
+            if message
+            else (tr("✅ Done") if success else tr("⚠ Failed"))
+        )
         self.update_channel_status(channel_id, final_message)
         self.update_bulk_controls()
 
@@ -1157,18 +1381,24 @@ class ChannelsTab(QWidget):
             channel_id = self.channels_table.item(current_row, 0).text()
             
             reply = QMessageBox.question(
-                self, "Delete Channel",
-                f"Are you sure you want to delete channel '{channel_id}'?\n"
-                "This action cannot be undone.",
+                self,
+                tr("Delete Channel"),
+                tr("Are you sure you want to delete channel '{channel_id}'?\nThis action cannot be undone.").format(
+                    channel_id=channel_id
+                ),
                 QMessageBox.Yes | QMessageBox.No
             )
             
             if reply == QMessageBox.Yes:
                 if self.config_manager.delete_channel(channel_id):
                     self.refresh_channels()
-                    QMessageBox.information(self, "Success", "Channel deleted successfully!")
+                    QMessageBox.information(
+                        self,
+                        tr("Success"),
+                        tr("Channel deleted successfully!"),
+                    )
                 else:
-                    QMessageBox.critical(self, "Error", "Failed to delete channel!")
+                    QMessageBox.critical(self, tr("Error"), tr("Failed to delete channel!"))
 
     def prepare_shutdown(self) -> None:
         for worker in list(self.pipeline_workers.values()):

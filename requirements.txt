@@ -23,4 +23,5 @@ requests_auth_aws_sigv4>=0.7
 undetected-chromedriver>=3.5.5
 moviepy==1.0.3
 Pillow>=11.0.0
+pyngrok>=6.0.0
 
