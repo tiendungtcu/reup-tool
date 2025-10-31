@@ -22,4 +22,4 @@ echo "Close this terminal window or press Ctrl+C to stop the application"
 echo ""
 
 # Launch the GUI
-python3 start_gui.py
+python3 launch_gui.py

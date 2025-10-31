@@ -5,8 +5,9 @@ import platform
 import uuid
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Set, Tuple
+from typing import Dict, Any, Optional, List, Set, Tuple, Callable
 import subprocess
+import tempfile
 import threading
 import time
 from functools import lru_cache
@@ -15,7 +16,8 @@ from copy import deepcopy
 from autobot import ALL_CONFIGS, channel_events, event_lock, is_rendered, upload_to_tiktok
 
 from localization import translator, tr
-from auto_updater import AutoUpdater, UpdateNotificationDialog
+from auto_updater import AutoUpdater, UpdateNotificationDialog, UpdateDownloadDialog
+from app_paths import resource_path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,10 +25,12 @@ from PySide6.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QGroupBox, QScrollArea, QProgressBar, QStatusBar, QMenuBar, QMenu,
     QDialog, QDialogButtonBox, QGridLayout, QFrame, QListWidget, QListWidgetItem,
-    QSizePolicy, QToolButton, QButtonGroup, QRadioButton
+    QSizePolicy, QToolButton, QButtonGroup, QRadioButton, QSlider
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QUrl
 from PySide6.QtGui import QIcon, QFont, QPixmap, QAction, QActionGroup
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 
 try:
     from PIL import Image, ImageFilter
@@ -35,17 +39,123 @@ except ImportError:
     ImageFilter = None
 
 import numpy as np
+import typing  # Preload stdlib typing to avoid cv2 path hacks shadowing it
 
-from moviepy.editor import (
+CV2_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _prioritize_stdlib_paths() -> None:
+    """Ensure bundled stdlib entries stay ahead of vendor directories."""
+
+    markers = (
+        "base_library.zip",
+        "python3.12/lib-dynload",
+        "python3.12/lib",
+    )
+
+    stdlib_entries: List[str] = []
+    other_entries: List[str] = []
+
+    for entry in list(sys.path):
+        if any(marker in entry for marker in markers):
+            if entry not in stdlib_entries:
+                stdlib_entries.append(entry)
+        else:
+            other_entries.append(entry)
+
+    if stdlib_entries:
+        deduped: List[str] = []
+        for path in stdlib_entries + other_entries:
+            if path not in deduped:
+                deduped.append(path)
+        sys.path[:] = deduped
+
+
+def _import_cv2_with_bundle_fallback() -> tuple[Optional[object], Optional[BaseException]]:
+    """Import cv2, adding common bundle paths if the first attempt fails."""
+
+    _prioritize_stdlib_paths()
+
+    try:
+        import cv2 as module  # type: ignore
+        return module, None
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        search_roots: List[Path] = []
+
+        for attr in ("_MEIPASS",):
+            base = getattr(sys, attr, None)
+            if base:
+                search_roots.append(Path(base))
+
+        executable_path = Path(getattr(sys, "executable", "")).resolve()
+        if executable_path:
+            search_roots.extend(
+                [
+                    executable_path.parent,
+                    executable_path.parent.parent,
+                    executable_path.parent.parent / "Frameworks",
+                    executable_path.parent.parent / "Resources",
+                ]
+            )
+
+        try:
+            search_roots.append(resource_path())
+        except Exception:
+            pass
+
+        added_paths: List[str] = []
+        for root in search_roots:
+            if not root:
+                continue
+
+            candidates = [root]
+            candidates.extend(
+                root.joinpath(part) for part in ("lib", "Lib", "python3.12", "cv2")
+            )
+
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+
+                if candidate.name == "cv2" and candidate.is_dir():
+                    parent = candidate.parent
+                elif (candidate / "cv2").is_dir():
+                    parent = candidate
+                else:
+                    continue
+
+                parent_str = str(parent)
+                if parent_str in sys.path:
+                    continue
+
+                sys.path.insert(0, parent_str)
+                added_paths.append(parent_str)
+
+        if added_paths:
+            _prioritize_stdlib_paths()
+            try:
+                import cv2 as module  # type: ignore
+                return module, None
+            except BaseException as retry_exc:  # pragma: no cover - optional dependency
+                return None, retry_exc
+
+        return None, exc
+
+
+cv2, CV2_IMPORT_ERROR = _import_cv2_with_bundle_fallback()
+
+if cv2 is None:  # pragma: no cover - optional dependency
+    raise ImportError(CV2_IMPORT_ERROR)
+
+from moviepy import (
     VideoFileClip,
     AudioFileClip,
     ImageClip,
     ColorClip,
     CompositeVideoClip,
-    concatenate_videoclips,
+    vfx,
+    afx,
 )
-import moviepy.video.fx.all as vfx
-import moviepy.audio.fx.all as afx
 
 
 def _patch_pillow_resampling() -> None:
@@ -235,7 +345,9 @@ class ConfigManager:
             "domain_type": "ngrok",
             "websub_port": 8080,
             "telegram": "",
-            "is_human": 1
+            "is_human": 1,
+            "youtube_cookies": "",
+            "youtube_cookies_format": ""
         }
 
     def _default_channel_config(self) -> Dict[str, Any]:
@@ -272,7 +384,13 @@ class ConfigManager:
         if settings.get("telegram"):
             telegram = settings["telegram"]
             if "|" not in telegram:
-                errors.append(tr("Telegram format should be: chat_id|bot_token"))
+                errors.append(tr("Both Telegram Chat ID and Bot Token are required"))
+            else:
+                parts = telegram.split("|", 1)
+                if not parts[0].strip():
+                    errors.append(tr("Telegram Chat ID is required"))
+                if not parts[1].strip():
+                    errors.append(tr("Telegram Bot Token is required"))
 
         websub_port = settings.get("websub_port", 8080)
         if not isinstance(websub_port, int) or websub_port < 1000 or websub_port > 65535:
@@ -364,6 +482,10 @@ class SettingsTab(QWidget):
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
         self.config_manager = config_manager
+        self.youtube_cookie_edit: Optional[QTextEdit] = None
+        self.youtube_cookie_status: Optional[QLabel] = None
+        self.load_youtube_cookie_btn: Optional[QPushButton] = None
+        self.clear_youtube_cookie_btn: Optional[QPushButton] = None
         self.setup_ui()
         self.load_settings()
     
@@ -389,7 +511,7 @@ class SettingsTab(QWidget):
         self.ngrok_token_edit.setPlaceholderText("Your ngrok auth token")
         self.ngrok_token_edit.setEchoMode(QLineEdit.Password)
         self._prepare_line_edit(self.ngrok_token_edit)
-        websub_layout.addRow("Ngrok Auth Token:", self.ngrok_token_edit)
+        # websub_layout.addRow("Ngrok Auth Token:", self.ngrok_token_edit)
         
         self.domain_type_combo = QComboBox()
         self.domain_type_combo.addItems(["ngrok", "custom"])
@@ -407,13 +529,55 @@ class SettingsTab(QWidget):
         telegram_layout = QFormLayout()
         telegram_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         
-        self.telegram_edit = QLineEdit()
-        self.telegram_edit.setPlaceholderText("chat_id|bot_token")
-        self._prepare_line_edit(self.telegram_edit)
-        telegram_layout.addRow("Telegram Bot:", self.telegram_edit)
+        self.telegram_chat_id_edit = QLineEdit()
+        self.telegram_chat_id_edit.setPlaceholderText("6601226586")
+        self._prepare_line_edit(self.telegram_chat_id_edit)
+        telegram_layout.addRow("Telegram Chat ID:", self.telegram_chat_id_edit)
+        
+        self.telegram_bot_token_edit = QLineEdit()
+        self.telegram_bot_token_edit.setPlaceholderText("8295256760:AAF5xzq_Emngvp-g8SqhASJBLcvjJHvjr4Y")
+        self._prepare_line_edit(self.telegram_bot_token_edit)
+        telegram_layout.addRow("Telegram Bot Token:", self.telegram_bot_token_edit)
         
         telegram_group.setLayout(telegram_layout)
         
+        # YouTube Authentication
+        youtube_group = QGroupBox(tr("YouTube Authentication"))
+        youtube_layout = QVBoxLayout()
+        youtube_description = QLabel(
+            tr("Provide YouTube cookies to allow yt-dlp to access videos that require sign-in.")
+        )
+        youtube_description.setWordWrap(True)
+        youtube_layout.addWidget(youtube_description)
+
+        youtube_button_layout = QHBoxLayout()
+        self.load_youtube_cookie_btn = QPushButton(tr("Load from File"))
+        self.load_youtube_cookie_btn.clicked.connect(self.load_youtube_cookies_from_file)
+        youtube_button_layout.addWidget(self.load_youtube_cookie_btn)
+
+        self.clear_youtube_cookie_btn = QPushButton(tr("Clear"))
+        self.clear_youtube_cookie_btn.clicked.connect(self.clear_youtube_cookies)
+        youtube_button_layout.addWidget(self.clear_youtube_cookie_btn)
+        youtube_button_layout.addStretch()
+        youtube_layout.addLayout(youtube_button_layout)
+
+        self.youtube_cookie_edit = QTextEdit()
+        self.youtube_cookie_edit.setAcceptRichText(False)
+        self.youtube_cookie_edit.setPlaceholderText(
+            tr("Paste cookies JSON (e.g. from browser export) or Netscape cookies.txt content")
+        )
+        self.youtube_cookie_edit.setMinimumHeight(120)
+        self.youtube_cookie_edit.setMinimumWidth(380)
+        self.youtube_cookie_edit.textChanged.connect(self._on_youtube_cookies_changed)
+        youtube_layout.addWidget(self.youtube_cookie_edit)
+
+        self.youtube_cookie_status = QLabel("")
+        self.youtube_cookie_status.setWordWrap(True)
+        youtube_layout.addWidget(self.youtube_cookie_status)
+
+        youtube_group.setLayout(youtube_layout)
+        youtube_group.setMinimumWidth(420)
+
         # Global Behavior
         behavior_group = QGroupBox("Global Behavior")
         behavior_layout = QFormLayout()
@@ -422,12 +586,13 @@ class SettingsTab(QWidget):
         self.is_human_check = QCheckBox()
         behavior_layout.addRow("Human-like Behavior:", self.is_human_check)
         
-        behavior_group.setLayout(behavior_layout)
+        # behavior_group.setLayout(behavior_layout)
         
         # Add groups to main layout
         scroll_layout.addWidget(websub_group)
         scroll_layout.addWidget(telegram_group)
-        scroll_layout.addWidget(behavior_group)
+        scroll_layout.addWidget(youtube_group)
+        # scroll_layout.addWidget(behavior_group)
         
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
@@ -443,8 +608,40 @@ class SettingsTab(QWidget):
         button_layout.addWidget(self.reset_btn)
         button_layout.addStretch()
         
+        # Console Log section
+        console_group = QGroupBox("Console Log")
+        console_layout = QVBoxLayout()
+        
+        self.console_log = QTextEdit()
+        self.console_log.setReadOnly(True)
+        self.console_log.setMaximumHeight(300)
+        self.console_log.setStyleSheet("""
+            QTextEdit {
+                font-family: 'Courier New', monospace;
+                font-size: 10px;
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+            }
+        """)
+        console_layout.addWidget(self.console_log)
+        
+        # Console controls
+        console_controls = QHBoxLayout()
+        self.clear_log_btn = QPushButton("Clear Log")
+        self.clear_log_btn.clicked.connect(self.clear_console_log)
+        self.auto_scroll_check = QCheckBox("Auto-scroll")
+        self.auto_scroll_check.setChecked(True)
+        
+        console_controls.addWidget(self.clear_log_btn)
+        console_controls.addWidget(self.auto_scroll_check)
+        console_controls.addStretch()
+        console_layout.addLayout(console_controls)
+        
+        console_group.setLayout(console_layout)
+        
         layout.addWidget(scroll)
         layout.addLayout(button_layout)
+        layout.addWidget(console_group)
         self.setLayout(layout)
 
     def _prepare_line_edit(self, widget: QLineEdit):
@@ -459,18 +656,59 @@ class SettingsTab(QWidget):
         self.ngrok_token_edit.setText(settings.get("ngrok_auth_token", ""))
         self.domain_type_combo.setCurrentText(settings.get("domain_type", "ngrok"))
         self.websub_port_spin.setValue(settings.get("websub_port", 8080))
-        self.telegram_edit.setText(settings.get("telegram", ""))
+        
+        # Parse telegram setting (chat_id|bot_token)
+        telegram = settings.get("telegram", "")
+        if telegram and "|" in telegram:
+            chat_id, bot_token = telegram.split("|", 1)
+            self.telegram_chat_id_edit.setText(chat_id.strip())
+            self.telegram_bot_token_edit.setText(bot_token.strip())
+        else:
+            self.telegram_chat_id_edit.setText("")
+            self.telegram_bot_token_edit.setText("")
+        
         self.is_human_check.setChecked(bool(settings.get("is_human", 1)))
+
+        youtube_cookies = settings.get("youtube_cookies", "") or ""
+        if self.youtube_cookie_edit is not None:
+            self.youtube_cookie_edit.blockSignals(True)
+            self.youtube_cookie_edit.setPlainText(youtube_cookies)
+            self.youtube_cookie_edit.blockSignals(False)
+
+        detected_format = self._detect_youtube_cookie_format(youtube_cookies) if youtube_cookies else ""
+        self._update_youtube_cookie_status(detected_format, invalid=bool(youtube_cookies and not detected_format))
     
     def save_settings(self):
         """Save settings from UI"""
+        # Combine chat_id and bot_token into telegram format
+        chat_id = self.telegram_chat_id_edit.text().strip()
+        bot_token = self.telegram_bot_token_edit.text().strip()
+        telegram = f"{chat_id}|{bot_token}" if chat_id and bot_token else ""
+
+        youtube_cookies_text = ""
+        if self.youtube_cookie_edit is not None:
+            youtube_cookies_text = self.youtube_cookie_edit.toPlainText().strip()
+
+        youtube_cookies_format = ""
+        if youtube_cookies_text:
+            youtube_cookies_format = self._detect_youtube_cookie_format(youtube_cookies_text) or ""
+            if not youtube_cookies_format:
+                QMessageBox.warning(
+                    self,
+                    tr("Validation Error"),
+                    tr("YouTube cookies must be JSON or Netscape cookies.txt format."),
+                )
+                return
+        
         settings = {
             "websub_url": self.websub_url_edit.text().strip(),
             "ngrok_auth_token": self.ngrok_token_edit.text().strip(),
             "domain_type": self.domain_type_combo.currentText(),
             "websub_port": self.websub_port_spin.value(),
-            "telegram": self.telegram_edit.text().strip(),
-            "is_human": 1 if self.is_human_check.isChecked() else 0
+            "telegram": telegram,
+            "is_human": 1 if self.is_human_check.isChecked() else 0,
+            "youtube_cookies": youtube_cookies_text,
+            "youtube_cookies_format": youtube_cookies_format,
         }
         
         # Validate settings
@@ -498,6 +736,119 @@ class SettingsTab(QWidget):
             if self.config_manager.save_settings(default_settings):
                 self.load_settings()
                 QMessageBox.information(self, tr("Success"), tr("Settings reset to default!"))
+    
+    def clear_console_log(self):
+        """Clear the console log"""
+        self.console_log.clear()
+    
+    def append_console_log(self, message: str):
+        """Append a message to the console log"""
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_message = f"[{timestamp}] {message}"
+        self.console_log.append(formatted_message)
+        
+        # Auto-scroll to bottom if enabled
+        if self.auto_scroll_check.isChecked():
+            scrollbar = self.console_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def load_youtube_cookies_from_file(self) -> None:
+        if self.youtube_cookie_edit is None:
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("Select cookie file"),
+            str(Path.home()),
+            tr("Cookie Files (*.json *.txt);;All Files (*)"),
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                tr("Error"),
+                tr("Failed to read cookies file: {error}").format(error=str(exc)),
+            )
+            return
+
+        self.youtube_cookie_edit.setPlainText(content)
+
+        detected = self._detect_youtube_cookie_format(content)
+        if content and not detected:
+            QMessageBox.warning(
+                self,
+                tr("Warning"),
+                tr("The selected file does not look like JSON or Netscape cookies."),
+            )
+
+    def clear_youtube_cookies(self) -> None:
+        if self.youtube_cookie_edit is None:
+            return
+        self.youtube_cookie_edit.clear()
+
+    def _on_youtube_cookies_changed(self) -> None:
+        if self.youtube_cookie_edit is None:
+            return
+        text = self.youtube_cookie_edit.toPlainText().strip()
+        if not text:
+            self._update_youtube_cookie_status("", invalid=False)
+            return
+        detected = self._detect_youtube_cookie_format(text)
+        self._update_youtube_cookie_status(detected, invalid=detected is None)
+
+    def _detect_youtube_cookie_format(self, raw: str) -> Optional[str]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, (dict, list)):
+                return "json"
+        except json.JSONDecodeError:
+            pass
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.count("\t") >= 6:
+                return "netscape"
+        return None
+
+    def _update_youtube_cookie_status(self, format_code: Optional[str], *, invalid: bool = False) -> None:
+        if self.youtube_cookie_status is None:
+            return
+
+        if invalid and not format_code:
+            self.youtube_cookie_status.setText(
+                tr("Unrecognized cookie format. Please provide JSON or Netscape cookies.txt content.")
+            )
+            self.youtube_cookie_status.setStyleSheet("color: #c0392b;")
+            return
+
+        if not format_code:
+            self.youtube_cookie_status.setText(tr("No cookies configured."))
+            self.youtube_cookie_status.setStyleSheet("color: #666666;")
+            return
+
+        if format_code == "json":
+            self.youtube_cookie_status.setText(
+                tr("Detected JSON cookie data. A temporary cookies.txt will be generated for yt-dlp.")
+            )
+        elif format_code == "netscape":
+            self.youtube_cookie_status.setText(
+                tr("Detected Netscape cookies.txt format. It will be passed directly to yt-dlp.")
+            )
+        else:
+            self.youtube_cookie_status.setText(tr("Cookies configured."))
+
+        self.youtube_cookie_status.setStyleSheet("")
 
 
 class YTDLPWorker(QThread):
@@ -512,6 +863,7 @@ class YTDLPWorker(QThread):
         mode: str,
         format_id: Optional[str] = None,
         output_dir: Optional[str] = None,
+        youtube_cookies: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.url = url
@@ -520,6 +872,7 @@ class YTDLPWorker(QThread):
         self.output_dir = output_dir
         self._last_downloaded_path = None
         self._cancel_event = threading.Event()
+        self.youtube_cookies = youtube_cookies or {}
 
     def run(self) -> None:
         try:
@@ -529,8 +882,10 @@ class YTDLPWorker(QThread):
             self.completed.emit(False, "yt-dlp not available")
             return
 
+        cookie_path = None
         try:
             self._check_cancelled()
+            cookie_path = self._prepare_cookie_file()
 
             if self.mode == "fetch":
                 ydl_opts = {
@@ -538,7 +893,17 @@ class YTDLPWorker(QThread):
                     "skip_download": True,
                     "noplaylist": True,
                     "no_warnings": True,
+                    "extractor_args": {
+                        "youtube": {
+                            "skip": ["hsl", "dash", "translated_subs"],
+                            "player_client": ["tv", "android"],
+                            "player_skip": ["webpage", "initial_data"],
+                            "webpage_skip": ["player_response", "initial_data"],
+                        }
+                    },
                 }
+                if cookie_path:
+                    ydl_opts["cookiefile"] = cookie_path
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(self.url, download=False)
                 self._check_cancelled()
@@ -562,6 +927,8 @@ class YTDLPWorker(QThread):
                     "socket_timeout": 30,
                     "progress_hooks": [progress_hook],
                 }
+                if cookie_path:
+                    ydl_opts["cookiefile"] = cookie_path
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([self.url])
                 self.completed.emit(True, "Download completed")
@@ -572,6 +939,12 @@ class YTDLPWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
             self.completed.emit(False, str(exc))
+        finally:
+            if cookie_path:
+                try:
+                    os.remove(cookie_path)
+                except OSError:
+                    pass
 
     def _progress_hook(self, status: Dict[str, Any]) -> None:
         self._check_cancelled()
@@ -611,6 +984,110 @@ class YTDLPWorker(QThread):
         if self._cancel_event.is_set() or self.isInterruptionRequested():
             raise WorkerCancelled()
 
+    def _prepare_cookie_file(self) -> Optional[str]:
+        raw = str(self.youtube_cookies.get("raw", "") or "").strip()
+        fmt = str(self.youtube_cookies.get("format", "") or "").strip().lower()
+
+        if not raw or not fmt:
+            return None
+
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix="_cookies.txt", delete=False, encoding="utf-8") as tmp:
+                if fmt == "netscape":
+                    tmp.write(raw)
+                    if not raw.endswith("\n"):
+                        tmp.write("\n")
+                elif fmt == "json":
+                    lines = self._convert_json_cookies(raw)
+                    tmp.write("# Netscape HTTP Cookie File\n")
+                    tmp.write("# This file was generated by AutoBot GUI\n")
+                    for line in lines:
+                        tmp.write(line)
+                        tmp.write("\n")
+                else:
+                    raise ValueError(tr("Unsupported YouTube cookies format: {fmt}").format(fmt=fmt))
+                return tmp.name
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(tr("Failed to prepare YouTube cookies: {error}").format(error=str(exc)))
+
+    def _convert_json_cookies(self, raw_json: str) -> List[str]:
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(tr("Invalid JSON cookies: {error}").format(error=str(exc)))
+
+        cookies: List[Dict[str, Any]] = []
+        if isinstance(data, list):
+            cookies = [c for c in data if isinstance(c, dict)]
+        elif isinstance(data, dict):
+            if isinstance(data.get("cookies"), list):
+                cookies = [c for c in data["cookies"] if isinstance(c, dict)]
+            else:
+                cookies = [data]
+        else:
+            raise ValueError(tr("Unsupported JSON cookies structure."))
+
+        lines: List[str] = []
+        for cookie in cookies:
+            domain = (cookie.get("domain") or cookie.get("host") or "").strip()
+            if not domain:
+                continue
+
+            path = (cookie.get("path") or "/").strip() or "/"
+            secure_flag = "TRUE" if cookie.get("secure") else "FALSE"
+            http_only = bool(cookie.get("httpOnly") or cookie.get("httponly"))
+            host_only = cookie.get("hostOnly")
+
+            expiry = cookie.get("expires")
+            if expiry is None:
+                expiry = cookie.get("expirationDate")
+            if expiry is None:
+                expiry = cookie.get("expiry")
+            try:
+                expiry_value = int(float(expiry)) if expiry is not None else 0
+                if expiry_value < 0:
+                    expiry_value = 0
+            except (TypeError, ValueError):
+                expiry_value = 0
+
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name is None or value is None:
+                continue
+
+            domain_value = domain
+            if host_only is False and not domain_value.startswith("."):
+                domain_value = f".{domain_value}"
+            tailmatch = "TRUE" if domain_value.startswith(".") else "FALSE"
+            if host_only is True:
+                tailmatch = "FALSE"
+
+            if http_only and not domain_value.startswith("#HttpOnly_"):
+                domain_value = f"#HttpOnly_{domain_value.lstrip('#')}"
+
+            sanitized_name = str(name).strip()
+            sanitized_value = str(value)
+
+            line = "\t".join(
+                [
+                    domain_value,
+                    tailmatch,
+                    path,
+                    secure_flag,
+                    str(expiry_value),
+                    sanitized_name,
+                    sanitized_value,
+                ]
+            )
+            lines.append(line)
+
+        if not lines:
+            raise ValueError(tr("No valid cookies found in JSON data."))
+
+        return lines
+
 
 class VideoEditingWorker(QThread):
     progress = Signal(str)
@@ -625,7 +1102,6 @@ class VideoEditingWorker(QThread):
 
     def run(self) -> None:
         output_path = ""
-        other_clip = None
         audio_resources: List[Any] = []
         clips_to_close: List[Any] = []
         cleanup_ids: Set[int] = set()
@@ -637,6 +1113,177 @@ class VideoEditingWorker(QThread):
             if obj_id not in cleanup_ids:
                 cleanup_ids.add(obj_id)
                 clips_to_close.append(clip_obj)
+
+        temp_paths: List[Path] = []
+
+        def create_temp_file(suffix: str = ".mp4") -> Path:
+            temp_handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            temp_path = Path(temp_handle.name)
+            temp_handle.close()
+            temp_paths.append(temp_path)
+            return temp_path
+
+        def ensure_frame_size(frame: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+            if cv2 is None:
+                raise RuntimeError("OpenCV is required for interleaving videos.")
+            if frame is None:
+                raise RuntimeError("Encountered empty frame during interleave.")
+            target_width, target_height = target_size
+            height, width = frame.shape[:2]
+            if width != target_width or height != target_height:
+                return cv2.resize(frame, (target_width, target_height))
+            return frame
+
+        def interleave_videos_with_cv2(
+            primary_path: Path,
+            secondary_path: Path,
+            raw_output_path: Path,
+            fps_value: float,
+            segment_length_frames: int,
+            target_size: Tuple[int, int],
+            repeat_secondary: bool,
+        ) -> None:
+            if cv2 is None:
+                raise RuntimeError("OpenCV is required for interleaving videos.")
+
+            cap_primary = cv2.VideoCapture(str(primary_path))
+            if not cap_primary.isOpened():
+                raise RuntimeError("Failed to open primary video for interleaving.")
+
+            cap_secondary = cv2.VideoCapture(str(secondary_path))
+            if not cap_secondary.isOpened():
+                cap_primary.release()
+                raise RuntimeError("Failed to open interleave video for interleaving.")
+
+            try:
+                fps_resolved = max(1.0, float(fps_value or 30.0))
+            except (TypeError, ValueError):
+                fps_resolved = 30.0
+
+            target_width, target_height = target_size
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(raw_output_path), fourcc, fps_resolved, (target_width, target_height))
+            if not writer.isOpened():
+                cap_primary.release()
+                cap_secondary.release()
+                raise RuntimeError("Failed to initialize OpenCV writer for interleaving.")
+
+            frames_written = 0
+            segment_length_frames = max(1, int(segment_length_frames))
+
+            try:
+                primary_finished = False
+                secondary_available = True
+
+                while not primary_finished:
+                    self._ensure_running()
+
+                    primary_count = 0
+                    while primary_count < segment_length_frames:
+                        self._ensure_running()
+                        ret1, frame1 = cap_primary.read()
+                        if not ret1 or frame1 is None:
+                            primary_finished = True
+                            break
+                        writer.write(ensure_frame_size(frame1, target_size))
+                        frames_written += 1
+                        primary_count += 1
+
+                    if primary_finished:
+                        break
+
+                    if not secondary_available:
+                        continue
+
+                    secondary_count = 0
+                    consecutive_failures = 0
+                    while secondary_count < segment_length_frames and secondary_available:
+                        self._ensure_running()
+                        ret2, frame2 = cap_secondary.read()
+                        if not ret2 or frame2 is None:
+                            consecutive_failures += 1
+                            if repeat_secondary and consecutive_failures < 3:
+                                cap_secondary.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                continue
+                            secondary_available = False
+                            break
+                        consecutive_failures = 0
+                        writer.write(ensure_frame_size(frame2, target_size))
+                        frames_written += 1
+                        secondary_count += 1
+
+            finally:
+                cap_primary.release()
+                cap_secondary.release()
+                writer.release()
+
+            if frames_written == 0:
+                raise RuntimeError("Interleave operation produced no frames.")
+
+        def compress_interleaved_video(
+            raw_input: Path,
+            destination: Path,
+            audio_source: Optional[Path],
+            crf: int = 23,
+        ) -> None:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(raw_input),
+            ]
+
+            if audio_source is not None:
+                cmd.extend(
+                    [
+                        "-i",
+                        str(audio_source),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a?",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "slow",
+                        "-crf",
+                        str(crf),
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        "-movflags",
+                        "+faststart",
+                        str(destination),
+                    ]
+                )
+            else:
+                cmd.extend(
+                    [
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "slow",
+                        "-crf",
+                        str(crf),
+                        "-an",
+                        "-movflags",
+                        "+faststart",
+                        str(destination),
+                    ]
+                )
+
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            except FileNotFoundError as exc:
+                raise RuntimeError("ffmpeg is required for interleaving but was not found.") from exc
+
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(f"ffmpeg failed to encode interleaved video: {stderr}")
 
         try:
             self._ensure_running()
@@ -655,9 +1302,11 @@ class VideoEditingWorker(QThread):
                 color = tuple(self.options.get("line_color", (255, 255, 255)))
                 self.progress.emit(tr("Adding center line..."))
                 self._ensure_running()
-                line_clip = ColorClip(size=(result_clip.w, thickness), color=color)
-                line_clip = line_clip.set_duration(result_clip.duration)
-                line_clip = line_clip.set_position(("center", "center"))
+                line_clip = (
+                    ColorClip(size=(result_clip.w, thickness), color=color)
+                    .with_duration(result_clip.duration)
+                    .with_position(("center", "center"))
+                )
                 register_clip(line_clip)
                 result_clip = CompositeVideoClip(
                     [result_clip, line_clip], size=result_clip.size, use_bgclip=True
@@ -679,7 +1328,7 @@ class VideoEditingWorker(QThread):
                     raise FileNotFoundError(f"Overlay image not found: {overlay_path}")
                 self.progress.emit(tr("Adding overlay image..."))
                 self._ensure_running()
-                overlay_clip = ImageClip(str(overlay_path)).set_duration(result_clip.duration)
+                overlay_clip = ImageClip(str(overlay_path)).with_duration(result_clip.duration)
                 register_clip(overlay_clip)
                 scale_factor = min(
                     result_clip.w / overlay_clip.w if overlay_clip.w else 1.0,
@@ -687,9 +1336,9 @@ class VideoEditingWorker(QThread):
                     1.0,
                 )
                 if scale_factor < 1.0:
-                    overlay_clip = overlay_clip.resize(scale_factor)
+                    overlay_clip = overlay_clip.resized(scale_factor)
                     register_clip(overlay_clip)
-                overlay_clip = overlay_clip.set_position(("center", "center"))
+                overlay_clip = overlay_clip.with_position(("center", "center"))
                 result_clip = CompositeVideoClip(
                     [result_clip, overlay_clip], size=result_clip.size, use_bgclip=True
                 )
@@ -697,57 +1346,89 @@ class VideoEditingWorker(QThread):
 
             # Interleave with another video
             if self.options.get("interleave") and self.options.get("interleave_path"):
+                if cv2 is None:
+                    detail = f" ({CV2_IMPORT_ERROR})" if CV2_IMPORT_ERROR else ""
+                    raise RuntimeError(
+                        tr("OpenCV is required to interleave videos. Please install opencv-python.")
+                        + detail
+                    )
+
                 interleave_path = Path(str(self.options.get("interleave_path")))
                 if not interleave_path.exists():
                     raise FileNotFoundError(f"Interleave video not found: {interleave_path}")
-                self.progress.emit(tr("Interleaving videos..."))
+
+                target_width = int(result_clip.w or 0)
+                target_height = int(result_clip.h or 0)
+                if target_width <= 0 or target_height <= 0:
+                    raise RuntimeError("Unable to determine video dimensions for interleave.")
+
+                segment_frames = int(self.options.get("interleave_segment_frames", 30))
+                segment_frames = max(1, segment_frames)
+
+                fps = getattr(result_clip, "fps", None)
+                if not fps and hasattr(result_clip, "reader"):
+                    fps = getattr(getattr(result_clip, "reader", None), "fps", None)
+                if not fps or fps <= 0:
+                    fps = 30.0
+                fps = float(fps)
+
+                has_audio = bool(result_clip.audio)
+
+                primary_duration = float(result_clip.duration or 0.0)
+                secondary_duration = 0.0
+                try:
+                    with VideoFileClip(str(interleave_path)) as probe_clip:
+                        secondary_duration = float(probe_clip.duration or 0.0)
+                except Exception:
+                    secondary_duration = 0.0
+                if primary_duration <= 0:
+                    raise RuntimeError("Primary video has zero duration.")
+                if secondary_duration <= 0:
+                    raise RuntimeError("Secondary video has zero duration")
+                repeat_secondary = secondary_duration > 0 and secondary_duration < primary_duration
+
+                self.progress.emit(tr("Preparing primary clip for interleave..."))
                 self._ensure_running()
-                other_clip = VideoFileClip(str(interleave_path))
-                register_clip(other_clip)
-                other_clip = other_clip.resize(result_clip.size)
-                register_clip(other_clip)
+                primary_temp_path = create_temp_file(".mp4")
+                write_kwargs: Dict[str, Any] = {
+                    "codec": "libx264",
+                    "fps": fps,
+                    "threads": 4,
+                    "logger": None,
+                }
+                if has_audio:
+                    write_kwargs["audio_codec"] = "aac"
+                else:
+                    write_kwargs["audio"] = False
+                result_clip.write_videofile(str(primary_temp_path), **write_kwargs)
+                self._ensure_running()
 
-                primary_duration = result_clip.duration
-                secondary_duration = other_clip.duration
-                segment_length = max(0.5, float(self.options.get("interleave_segment", 1.0)))
-                segments: List[Any] = []
-                segments_ids: Set[int] = set()
+                raw_interleave_path = create_temp_file(".mp4")
+                final_interleave_path = create_temp_file(".mp4")
 
-                def add_segment(segment_clip: Any) -> None:
-                    if segment_clip is None:
-                        return
-                    seg_id = id(segment_clip)
-                    if seg_id not in segments_ids:
-                        segments_ids.add(seg_id)
-                        segments.append(segment_clip)
-                        register_clip(segment_clip)
+                self.progress.emit(tr("Interleaving videos with OpenCV..."))
+                self._ensure_running()
+                interleave_videos_with_cv2(
+                    primary_temp_path,
+                    interleave_path,
+                    raw_interleave_path,
+                    fps,
+                    segment_frames,
+                    (target_width, target_height),
+                    repeat_secondary,
+                )
+                self._ensure_running()
 
-                t_primary = 0.0
-                t_secondary = 0.0
-                use_primary = True
+                self.progress.emit(tr("Encoding interleaved video..."))
+                self._ensure_running()
+                compress_interleaved_video(
+                    raw_interleave_path,
+                    final_interleave_path,
+                    primary_temp_path if has_audio else None,
+                )
+                self._ensure_running()
 
-                while t_primary < primary_duration or t_secondary < secondary_duration:
-                    self._ensure_running()
-                    if use_primary and t_primary < primary_duration:
-                        start = t_primary
-                        end = min(start + segment_length, primary_duration)
-                        add_segment(result_clip.subclip(start, end))
-                        t_primary = end
-                        use_primary = False
-                    elif not use_primary and t_secondary < secondary_duration:
-                        start = t_secondary
-                        end = min(start + segment_length, secondary_duration)
-                        add_segment(other_clip.subclip(start, end))
-                        t_secondary = end
-                        use_primary = True
-                    else:
-                        # Switch to whichever clip still has content
-                        use_primary = not use_primary
-
-                if not segments:
-                    raise RuntimeError("Interleave operation produced no segments")
-
-                result_clip = concatenate_videoclips(segments, method="compose")
+                result_clip = VideoFileClip(str(final_interleave_path))
                 register_clip(result_clip)
 
             # Mute original audio
@@ -768,13 +1449,15 @@ class VideoEditingWorker(QThread):
                 audio_resources.append(base_audio)
 
                 if base_audio.duration < result_clip.duration:
-                    final_audio = afx.audio_loop(base_audio, duration=result_clip.duration)
+                    final_audio = base_audio.with_effects(
+                        [afx.AudioLoop(duration=result_clip.duration)]
+                    )
                     audio_resources.append(final_audio)
                 else:
-                    final_audio = base_audio.subclip(0, result_clip.duration)
+                    final_audio = base_audio.subclipped(0, result_clip.duration)
                     audio_resources.append(final_audio)
 
-                result_clip = result_clip.set_audio(final_audio)
+                result_clip = result_clip.with_audio(final_audio)
                 register_clip(result_clip)
 
             # Rotate
@@ -783,7 +1466,7 @@ class VideoEditingWorker(QThread):
                 if angle % 360:
                     self.progress.emit(tr("Rotating video..."))
                     self._ensure_running()
-                    result_clip = result_clip.rotate(angle)
+                    result_clip = result_clip.rotated(angle)
                     register_clip(result_clip)
 
             # Zoom in
@@ -792,14 +1475,14 @@ class VideoEditingWorker(QThread):
                 if factor > 1.0:
                     self.progress.emit(tr("Zooming in..."))
                     self._ensure_running()
-                    zoomed = result_clip.fx(vfx.resize, factor)
+                    zoomed = result_clip.with_effects([vfx.Resize(factor)])
                     register_clip(zoomed)
                     w, h = result_clip.size
                     x1 = max(0, int(round((zoomed.w - w) / 2)))
                     y1 = max(0, int(round((zoomed.h - h) / 2)))
                     x2 = x1 + w
                     y2 = y1 + h
-                    zoomed = vfx.crop(zoomed, x1=x1, y1=y1, x2=x2, y2=y2)
+                    zoomed = zoomed.cropped(x1=x1, y1=y1, x2=x2, y2=y2)
                     register_clip(zoomed)
                     result_clip = zoomed
 
@@ -809,18 +1492,19 @@ class VideoEditingWorker(QThread):
                 if 0 < factor < 1.0:
                     self.progress.emit(tr("Zooming out..."))
                     self._ensure_running()
-                    scaled = result_clip.fx(vfx.resize, factor)
+                    scaled = result_clip.with_effects([vfx.Resize(factor)])
                     register_clip(scaled)
-                    background = ColorClip(size=result_clip.size, color=(0, 0, 0))
-                    background = background.set_duration(result_clip.duration)
+                    background = ColorClip(size=result_clip.size, color=(0, 0, 0)).with_duration(
+                        result_clip.duration
+                    )
                     register_clip(background)
                     composite = CompositeVideoClip(
-                        [background, scaled.set_position(("center", "center"))],
+                        [background, scaled.with_position(("center", "center"))],
                         size=result_clip.size,
                         use_bgclip=True,
                     )
                     if result_clip.audio:
-                        composite = composite.set_audio(result_clip.audio)
+                        composite = composite.with_audio(result_clip.audio)
                     register_clip(composite)
                     result_clip = composite
 
@@ -843,7 +1527,6 @@ class VideoEditingWorker(QThread):
                 remove_temp=True,
                 threads=4,
                 logger=None,
-                verbose=False,
             )
 
             self.progress.emit(tr("Finished video editing"))
@@ -856,14 +1539,15 @@ class VideoEditingWorker(QThread):
                     resource.close()
                 except Exception:
                     pass
-            if other_clip is not None:
-                try:
-                    other_clip.close()
-                except Exception:
-                    pass
             for clip_obj in reversed(clips_to_close):
                 try:
                     clip_obj.close()
+                except Exception:
+                    pass
+            for temp_path in temp_paths:
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
                 except Exception:
                     pass
 
@@ -886,7 +1570,8 @@ class VideoEditingWorker(QThread):
             blurred = pil_image.filter(ImageFilter.GaussianBlur(radius=radius))
             return np.array(blurred)
 
-        return clip.fl_image(blur_frame)
+        # MoviePy 2.2.1 replaces fl_image with image_transform for per-frame filters
+        return clip.image_transform(blur_frame)
 
 
 class TikTokUploadWorker(QThread):
@@ -958,6 +1643,113 @@ class TikTokUploadWorker(QThread):
                 channel_events.pop(self.channel_id, None)
 
 
+class VideoPlayerDialog(QDialog):
+    def __init__(self, video_path: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("Video Preview"))
+        self.resize(960, 540)
+
+        self._video_path = video_path
+        self._duration_ms = 0
+        self._slider_is_pressed = False
+
+        layout = QVBoxLayout(self)
+
+        self.video_widget = QVideoWidget()
+        layout.addWidget(self.video_widget, stretch=1)
+
+        controls_layout = QHBoxLayout()
+
+        self.play_button = QPushButton("Play")
+        self.play_button.clicked.connect(self._toggle_playback)
+        controls_layout.addWidget(self.play_button)
+
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.position_slider.sliderReleased.connect(self._on_slider_released)
+        self.position_slider.sliderMoved.connect(self._on_slider_moved)
+        controls_layout.addWidget(self.position_slider, stretch=1)
+
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setMinimumWidth(140)
+        controls_layout.addWidget(self.time_label)
+
+        layout.addLayout(controls_layout)
+
+        self.audio_output = QAudioOutput()
+        self.audio_output.setVolume(0.8)
+
+        self.player = QMediaPlayer()
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+        self.player.setSource(QUrl.fromLocalFile(video_path))
+        self.player.playbackStateChanged.connect(self._on_state_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.errorOccurred.connect(self._on_error)
+
+        self.player.play()
+
+    def _toggle_playback(self) -> None:
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _on_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        if state == QMediaPlayer.PlayingState:
+            self.play_button.setText("Pause")
+        else:
+            self.play_button.setText("Play")
+
+    def _on_duration_changed(self, duration: int) -> None:
+        self._duration_ms = max(0, duration)
+        self.position_slider.setRange(0, self._duration_ms)
+        self._update_time_label(self.player.position())
+
+    def _on_position_changed(self, position: int) -> None:
+        if not self._slider_is_pressed:
+            self.position_slider.setValue(position)
+        self._update_time_label(position)
+
+    def _on_slider_pressed(self) -> None:
+        self._slider_is_pressed = True
+
+    def _on_slider_released(self) -> None:
+        self._slider_is_pressed = False
+        self.player.setPosition(self.position_slider.value())
+
+    def _on_slider_moved(self, value: int) -> None:
+        if self._slider_is_pressed:
+            self._update_time_label(value)
+
+    def _update_time_label(self, position: int) -> None:
+        def format_time(ms: int) -> str:
+            seconds = max(0, ms) // 1000
+            minutes, seconds = divmod(seconds, 60)
+            return f"{minutes:02d}:{seconds:02d}"
+
+        current = format_time(position)
+        total = format_time(self._duration_ms)
+        self.time_label.setText(f"{current} / {total}")
+
+    def _on_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
+        if error == QMediaPlayer.NoError:
+            return
+        QMessageBox.warning(
+            self,
+            tr("Playback Error"),
+            error_string or tr("Unable to play the selected video."),
+        )
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self.player.stop()
+        finally:
+            super().closeEvent(event)
+
+
 class UtilitiesTab(QWidget):
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
@@ -995,6 +1787,11 @@ class UtilitiesTab(QWidget):
         self.video_source_group: Optional[QButtonGroup] = None
         self.upload_channel_entries: List[Dict[str, Any]] = []
         self._syncing_custom_proxy = False
+        self.download_only_btn: Optional[QPushButton] = None
+        self.edit_last_btn: Optional[QPushButton] = None
+        self.edit_other_btn: Optional[QPushButton] = None
+        self.play_video_btn: Optional[QPushButton] = None
+        self._pending_edit_after_download = False
         self._setup_ui()
         self.refresh_upload_channels(initial=True)
         self._update_last_video_label()
@@ -1015,6 +1812,8 @@ class UtilitiesTab(QWidget):
 
         form_layout = QFormLayout()
         form_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form_layout.setLabelAlignment(Qt.AlignRight)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://www.youtube.com/watch?v=...")
@@ -1041,12 +1840,16 @@ class UtilitiesTab(QWidget):
         form_layout.addRow("", fetch_layout)
 
         self.video_title_label = QLabel("")
-        self.video_title_label.setWordWrap(True)
-        self.video_title_label.setMinimumWidth(500)
+        self.video_title_label.setWordWrap(False)
+        self.video_title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.video_title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form_layout.addRow("Video Title:", self.video_title_label)
 
         self.formats_combo = QComboBox()
         self.formats_combo.setEnabled(False)
+        self.formats_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.formats_combo.setMinimumContentsLength(40)
+        self.formats_combo.setSizeAdjustPolicy(QComboBox.AdjustToContentsOnFirstShow)
         form_layout.addRow("Available Formats:", self.formats_combo)
 
         folder_layout = QHBoxLayout()
@@ -1057,20 +1860,60 @@ class UtilitiesTab(QWidget):
         folder_layout.addWidget(self.folder_edit)
         folder_layout.addWidget(browse_btn)
         form_layout.addRow("Save Folder:", folder_layout)
+        
+        download_btn_layout = QHBoxLayout()
+        self.download_only_btn = QPushButton("Download Video Only", )
+        self.download_only_btn.setStyleSheet("""
+                QPushButton:hover {
+                    background-color: green;
+                    color: white;
+                    cursor: pointingHand;
+                }
+            """)
+        # self.download_only_btn.setToolTip(
+        #     tr("Only download the video with specified format, do not edit the video")
+        # )
+        self.download_only_btn.setEnabled(False)
+        self.download_only_btn.clicked.connect(self.download_only_video)
+        download_btn_layout.addWidget(self.download_only_btn)
+        form_layout.addRow("", download_btn_layout)
 
         content_layout.addLayout(form_layout)
 
-        controls_layout = QHBoxLayout()
-        self.download_btn = QPushButton("Download Video")
-        self.download_btn.setEnabled(False)
-        self.download_btn.clicked.connect(self.download_video)
-        controls_layout.addWidget(self.download_btn)
-        controls_layout.addStretch()
-        content_layout.addLayout(controls_layout)
-
         content_layout.addWidget(self._create_editing_group())
+
+        download_controls = QHBoxLayout()
+
+        self.download_btn = QPushButton("Download and Edit Video")
+        self.download_btn.setEnabled(False)
+        self.download_btn.clicked.connect(self.download_and_edit_video)
+        # download_controls.addWidget(self.download_btn)
+        download_controls.addStretch()
+        content_layout.addLayout(download_controls)
+
+        edit_controls = QHBoxLayout()
+        self.edit_last_btn = QPushButton("Edit Last Downloaded Video")
+        self.edit_last_btn.setEnabled(False)
+        self.edit_last_btn.clicked.connect(self.edit_last_video)
+        edit_controls.addWidget(self.edit_last_btn)
+
+        self.edit_other_btn = QPushButton("Edit Video From File...")
+        self.edit_other_btn.setToolTip(
+            tr("Setup Video Editing Options before choose the video to edit")
+        )
+        self.edit_other_btn.clicked.connect(self.edit_other_video)
+        edit_controls.addWidget(self.edit_other_btn)
+
+        self.play_video_btn = QPushButton(tr("Play"))
+        self.play_video_btn.setEnabled(False)
+        self.play_video_btn.clicked.connect(self.play_last_video)
+        edit_controls.addWidget(self.play_video_btn)
+        edit_controls.addStretch()
+        content_layout.addLayout(edit_controls)
+
         content_layout.addWidget(self._create_upload_group())
         content_layout.addStretch()
+
 
         scroll_area.setWidget(content_widget)
         main_layout.addWidget(scroll_area)
@@ -1086,6 +1929,7 @@ class UtilitiesTab(QWidget):
 
         self.setLayout(main_layout)
         self.on_platform_changed(self.platform_combo.currentText())
+        self._update_edit_buttons_state()
 
     def _create_editing_group(self) -> QGroupBox:
         group = QGroupBox("Video Editing Options")
@@ -1170,11 +2014,12 @@ class UtilitiesTab(QWidget):
         self.interleave_browse_btn = QPushButton("Browse")
         self.interleave_browse_btn.setEnabled(False)
         self.interleave_browse_btn.clicked.connect(self.choose_interleave_video)
-        self.interleave_segment_spin = QDoubleSpinBox()
-        self.interleave_segment_spin.setRange(0.5, 10.0)
-        self.interleave_segment_spin.setSingleStep(0.5)
-        self.interleave_segment_spin.setValue(1.0)
-        self.interleave_segment_spin.setSuffix(" s")
+
+        self.interleave_segment_spin = QSpinBox()
+        self.interleave_segment_spin.setRange(1, 10_000)
+        self.interleave_segment_spin.setSingleStep(1)
+        self.interleave_segment_spin.setValue(30)
+        self.interleave_segment_spin.setSuffix(" frames")
         self.interleave_segment_spin.setEnabled(False)
         self.interleave_checkbox.toggled.connect(lambda checked: self._set_widgets_enabled([
             self.interleave_path_edit,
@@ -1188,7 +2033,7 @@ class UtilitiesTab(QWidget):
         interleave_layout.setSpacing(6)
         interleave_layout.addWidget(self.interleave_path_edit)
         interleave_layout.addWidget(self.interleave_browse_btn)
-        interleave_layout.addWidget(QLabel("Segment:"))
+        interleave_layout.addWidget(QLabel("Frames:"))
         interleave_layout.addWidget(self.interleave_segment_spin)
 
         grid.addWidget(self.interleave_checkbox, row, 0, alignment=Qt.AlignLeft)
@@ -1321,7 +2166,7 @@ class UtilitiesTab(QWidget):
 
         channel_row = QHBoxLayout()
         self.upload_channel_combo = QComboBox()
-        self.upload_channel_combo.setPlaceholderText("Select channel with TikTok cookies")
+        self.upload_channel_combo.setPlaceholderText(tr("Select channel with TikTok cookies"))
         self.upload_channel_combo.currentIndexChanged.connect(self._on_channel_selection_changed)
         channel_row.addWidget(self.upload_channel_combo, 1)
 
@@ -1352,11 +2197,20 @@ class UtilitiesTab(QWidget):
         proxy_form = QFormLayout()
         proxy_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
+        proxy_input_layout = QHBoxLayout()
         self.custom_proxy_edit = QLineEdit()
         self.custom_proxy_edit.setPlaceholderText("host:port or host:port:username:password")
         self.custom_proxy_edit.setEnabled(False)
         self.custom_proxy_edit.textChanged.connect(self._on_custom_proxy_changed)
-        proxy_form.addRow("Upload Proxy:", self.custom_proxy_edit)
+        proxy_input_layout.addWidget(self.custom_proxy_edit)
+        
+        self.custom_proxy_test_btn = QPushButton("Test")
+        self.custom_proxy_test_btn.clicked.connect(self._test_custom_proxy)
+        self.custom_proxy_test_btn.setMaximumWidth(60)
+        self.custom_proxy_test_btn.setEnabled(False)
+        proxy_input_layout.addWidget(self.custom_proxy_test_btn)
+        
+        proxy_form.addRow("Upload Proxy:", proxy_input_layout)
         layout.addLayout(proxy_form)
 
         method_layout = QHBoxLayout()
@@ -1435,7 +2289,7 @@ class UtilitiesTab(QWidget):
         if self.refresh_channels_btn:
             self.refresh_channels_btn.setEnabled(use_channel)
 
-        for widget in (self.custom_cookie_edit, self.load_cookie_file_btn, self.clear_cookie_btn, self.custom_proxy_edit):
+        for widget in (self.custom_cookie_edit, self.load_cookie_file_btn, self.clear_cookie_btn, self.custom_proxy_edit, self.custom_proxy_test_btn):
             if widget:
                 widget.setEnabled(use_custom)
 
@@ -1644,6 +2498,106 @@ class UtilitiesTab(QWidget):
                 return False
         return True
 
+    def _test_custom_proxy(self):
+        """Test if the custom proxy connection is working"""
+        proxy_text = self.custom_proxy_edit.text().strip() if self.custom_proxy_edit else ""
+        
+        if not proxy_text:
+            QMessageBox.warning(
+                self,
+                tr("No Proxy"),
+                tr("Please enter a proxy address to test."),
+            )
+            return
+        
+        if not self._is_valid_proxy_format(proxy_text):
+            QMessageBox.warning(
+                self,
+                tr("Invalid Format"),
+                tr("Proxy format should be host:port or host:port:username:password."),
+            )
+            return
+        
+        # Parse proxy
+        parts = proxy_text.split(":")
+        host = parts[0]
+        port = int(parts[1])
+        
+        proxy_dict = {
+            "http": f"http://{proxy_text}",
+            "https": f"http://{proxy_text}",
+        }
+        
+        if len(parts) == 4:
+            username, password = parts[2], parts[3]
+            proxy_dict = {
+                "http": f"http://{username}:{password}@{host}:{port}",
+                "https": f"http://{username}:{password}@{host}:{port}",
+            }
+        
+        # Create worker thread for testing
+        class ProxyTestWorker(QThread):
+            finished = Signal(bool, str)
+            
+            def __init__(self, proxy_dict):
+                super().__init__()
+                self.proxy_dict = proxy_dict
+            
+            def run(self):
+                try:
+                    import requests
+                    response = requests.get(
+                        "https://www.google.com",
+                        proxies=self.proxy_dict,
+                        timeout=10
+                    )
+                    self.finished.emit(True, tr("Proxy is working! Status code: {code}").format(code=response.status_code))
+                except Exception as e:
+                    self.finished.emit(False, tr("Proxy connection failed:\n{error}").format(error=str(e)))
+        
+        # Show testing dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("Testing Proxy"))
+        dialog.setModal(True)
+        dialog.resize(400, 150)
+        
+        layout = QVBoxLayout()
+        
+        status_label = QLabel(tr("Testing proxy connection...\nThis may take a few seconds."))
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+        
+        progress = QProgressBar()
+        progress.setRange(0, 0)  # Indeterminate progress
+        layout.addWidget(progress)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.button(QDialogButtonBox.Close).setEnabled(False)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        # Create and start worker
+        worker = ProxyTestWorker(proxy_dict)
+        
+        def on_test_finished(success, message):
+            status_label.setText(message)
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            button_box.button(QDialogButtonBox.Close).setEnabled(True)
+            
+            if success:
+                status_label.setStyleSheet("color: green;")
+            else:
+                status_label.setStyleSheet("color: red;")
+        
+        worker.finished.connect(on_test_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        
+        dialog.exec()
+
     def _browse_custom_video(self) -> None:
         start_dir = (
             str((self.last_output_dir or Path(self.folder_edit.text()).expanduser()))
@@ -1666,6 +2620,21 @@ class UtilitiesTab(QWidget):
 
         self._update_upload_button_state()
 
+    def _is_busy(self) -> bool:
+        worker_busy = bool(self.active_worker and self.active_worker.isRunning())
+        edit_busy = bool(self.edit_worker and self.edit_worker.isRunning())
+        return worker_busy or edit_busy
+
+    def _update_edit_buttons_state(self) -> None:
+        busy = self._is_busy()
+        has_last = bool(self.last_download_path and Path(self.last_download_path).exists())
+        if self.edit_last_btn:
+            self.edit_last_btn.setEnabled(has_last and not busy)
+        if self.edit_other_btn:
+            self.edit_other_btn.setEnabled(not busy)
+        if self.play_video_btn:
+            self.play_video_btn.setEnabled(has_last and not busy)
+
     def _update_last_video_label(self) -> None:
         if not self.last_video_path_label:
             return
@@ -1680,6 +2649,7 @@ class UtilitiesTab(QWidget):
             self.last_video_path_label.setText("No video available yet.")
 
         self._update_upload_button_state()
+        self._update_edit_buttons_state()
 
     def _current_upload_video_path(self) -> Optional[str]:
         if self.use_last_video_radio and self.use_last_video_radio.isChecked():
@@ -1876,7 +2846,8 @@ class UtilitiesTab(QWidget):
         self._set_working_state(True, mode="fetch")
         self.status_label.setText(tr("Fetching available formats..."))
 
-        worker = YTDLPWorker(url=url, mode="fetch")
+        youtube_cookies = self._youtube_cookies_if_needed(url)
+        worker = YTDLPWorker(url=url, mode="fetch", youtube_cookies=youtube_cookies)
         worker.setParent(self)
         worker.formats_ready.connect(self.on_formats_ready)
         worker.progress.connect(self.on_worker_progress)
@@ -1888,7 +2859,27 @@ class UtilitiesTab(QWidget):
         worker.start()
         self.current_url = url
 
-    def download_video(self) -> None:
+    def download_only_video(self) -> None:
+        self._initiate_download(edit_after=False)
+
+    def download_and_edit_video(self) -> None:
+        if not self._any_edit_selected():
+            QMessageBox.warning(
+                self,
+                tr("No Edits Selected"),
+                tr("Enable at least one edit option before using Download and Edit."),
+            )
+            return
+        self._initiate_download(edit_after=True)
+
+    def _initiate_download(self, *, edit_after: bool) -> None:
+        if self.active_worker and self.active_worker.isRunning():
+            QMessageBox.warning(
+                self,
+                tr("Download In Progress"),
+                tr("Please wait for the current operation to finish before starting another download."),
+            )
+            return
         if self.edit_worker and self.edit_worker.isRunning():
             QMessageBox.warning(
                 self,
@@ -1943,11 +2934,15 @@ class UtilitiesTab(QWidget):
         self.status_label.setText(tr("Starting download..."))
         self.progress_bar.setValue(0)
 
+        self._pending_edit_after_download = bool(edit_after and self._any_edit_selected())
+
+        youtube_cookies = self._youtube_cookies_if_needed(self.current_url)
         worker = YTDLPWorker(
             url=self.current_url,
             mode="download",
             format_id=format_id,
             output_dir=str(output_dir),
+            youtube_cookies=youtube_cookies,
         )
         worker.setParent(self)
         worker.progress.connect(self.on_worker_progress)
@@ -1958,6 +2953,95 @@ class UtilitiesTab(QWidget):
         self.active_mode = "download"
         worker.start()
         self._update_last_video_label()
+
+    def edit_last_video(self) -> None:
+        if self._is_busy():
+            QMessageBox.warning(
+                self,
+                tr("Busy"),
+                tr("Please wait for the current task to finish before starting another edit."),
+            )
+            return
+
+        if not self.last_download_path or not Path(self.last_download_path).exists():
+            QMessageBox.warning(
+                self,
+                tr("No Video"),
+                tr("No previously downloaded video is available to edit."),
+            )
+            return
+
+        if not self._any_edit_selected():
+            QMessageBox.warning(
+                self,
+                tr("No Edits Selected"),
+                tr("Enable at least one edit option before starting an edit."),
+            )
+            return
+
+        self._start_edit_worker(self.last_download_path)
+
+    def edit_other_video(self) -> None:
+        if self._is_busy():
+            QMessageBox.warning(
+                self,
+                tr("Busy"),
+                tr("Please wait for the current task to finish before starting another edit."),
+            )
+            return
+
+        start_dir = str(self.last_output_dir or Path(self.folder_edit.text()).expanduser()) if hasattr(self, "folder_edit") else str(Path.cwd())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("Select video to edit"),
+            start_dir,
+            tr("Video Files (*.mp4 *.mov *.mkv *.webm *.m4v *.avi);;All Files (*)"),
+        )
+        if not file_path:
+            return
+
+        if not self._any_edit_selected():
+            QMessageBox.warning(
+                self,
+                tr("No Edits Selected"),
+                tr("Enable at least one edit option before starting an edit."),
+            )
+            return
+
+        self.last_download_path = file_path
+        self.last_output_dir = Path(file_path).parent
+        self._update_last_video_label()
+        self._start_edit_worker(file_path)
+
+    def play_last_video(self) -> None:
+        if self._is_busy():
+            QMessageBox.information(
+                self,
+                tr("Operation In Progress"),
+                tr("Please wait until the current task finishes before previewing the video."),
+            )
+            return
+
+        if not self.last_download_path:
+            QMessageBox.information(
+                self,
+                tr("No Video"),
+                tr("There is no edited video available to play yet."),
+            )
+            return
+
+        video_file = Path(self.last_download_path)
+        if not video_file.exists():
+            QMessageBox.warning(
+                self,
+                tr("Video Missing"),
+                tr("The expected video file no longer exists:\n{path}").format(path=str(video_file)),
+            )
+            self._update_last_video_label()
+            return
+
+        dialog = VideoPlayerDialog(str(video_file), self)
+        dialog.exec()
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -2032,26 +3116,76 @@ class UtilitiesTab(QWidget):
             "Vimeo",
         }
 
+    def _youtube_cookies_if_needed(self, url: Optional[str]) -> Optional[Dict[str, str]]:
+        if not self.config_manager:
+            return None
+
+        try:
+            settings = self.config_manager.load_settings()
+        except Exception:
+            return None
+
+        raw = str(settings.get("youtube_cookies") or "").strip()
+        fmt = str(settings.get("youtube_cookies_format") or "").strip().lower()
+
+        if not raw or fmt not in {"json", "netscape"}:
+            return None
+
+        if not self._should_apply_youtube_cookies(url):
+            return None
+
+        return {"raw": raw, "format": fmt}
+
+    def _should_apply_youtube_cookies(self, url: Optional[str]) -> bool:
+        platform = self.platform_combo.currentText() if self.platform_combo else ""
+
+        if platform == "YouTube":
+            return True
+
+        normalized_url = (url or "").lower()
+        if not normalized_url and self.current_url:
+            normalized_url = self.current_url.lower()
+
+        youtube_domains = (
+            "youtube.com",
+            "youtu.be",
+            "youtube-nocookie.com",
+            "music.youtube.com",
+        )
+
+        if platform == "Auto Detect (yt-dlp)" and normalized_url:
+            return any(domain in normalized_url for domain in youtube_domains)
+
+        if normalized_url:
+            return any(domain in normalized_url for domain in youtube_domains)
+
+        return False
+
     def _update_format_controls(self, has_formats: bool) -> None:
         supports_selection = self._platform_supports_format_selection()
+        busy = self._is_busy()
         if supports_selection:
-            self.formats_combo.setEnabled(has_formats)
-            self.download_btn.setEnabled(has_formats)
+            self.formats_combo.setEnabled(has_formats and not busy)
         else:
             self.formats_combo.setEnabled(False)
-            self.download_btn.setEnabled(has_formats)
+
+        allow_download = has_formats and not busy
+        self.download_btn.setEnabled(allow_download)
+        if self.download_only_btn:
+            self.download_only_btn.setEnabled(allow_download)
 
     def on_platform_changed(self, platform: str) -> None:
         placeholder_map = {
-            "Auto Detect (yt-dlp)": "Paste a supported video URL",
+            "Auto Detect (yt-dlp)": tr("Paste a supported video URL"),
             "YouTube": "https://www.youtube.com/watch?v=...",
             "TikTok": "https://www.tiktok.com/@user/video/...",
             "Instagram": "https://www.instagram.com/reel/...",
             "Vimeo": "https://vimeo.com/...",
             "Facebook Reel": "https://www.facebook.com/reel/...",
         }
+        default_placeholder = "Paste a supported video URL"
         self.url_edit.setPlaceholderText(
-            placeholder_map.get(platform, "Paste a supported video URL")
+            placeholder_map.get(platform, default_placeholder)
         )
 
         if self.active_worker and self.active_worker.isRunning():
@@ -2086,7 +3220,7 @@ class UtilitiesTab(QWidget):
             "overlay_path": self.overlay_path_edit.text().strip(),
             "interleave": self.interleave_checkbox.isChecked(),
             "interleave_path": self.interleave_path_edit.text().strip(),
-            "interleave_segment": self.interleave_segment_spin.value(),
+            "interleave_segment_frames": self.interleave_segment_spin.value(),
             "mute": self.mute_checkbox.isChecked(),
             "add_audio": self.audio_checkbox.isChecked(),
             "audio_path": self.audio_path_edit.text().strip(),
@@ -2118,8 +3252,8 @@ class UtilitiesTab(QWidget):
                 return "Select a secondary video to interleave."
             if not Path(interleave_path).exists():
                 return f"Secondary video not found: {interleave_path}"
-            if options.get("interleave_segment", 0) <= 0:
-                return "Interleave segment length must be greater than zero."
+            if options.get("interleave_segment_frames", 0) <= 0:
+                return "Interleave segment frames must be greater than zero."
 
         if options["add_audio"]:
             audio_path = options.get("audio_path")
@@ -2157,7 +3291,7 @@ class UtilitiesTab(QWidget):
             QMessageBox.warning(self, "Edit Options", validation_error)
             return False
 
-        self.status_label.setText("Applying video edits...")
+        self.status_label.setText(tr("Applying video edits..."))
         self.progress_bar.setRange(0, 0)
 
         output_dir = self.last_output_dir or Path(input_path).parent
@@ -2167,6 +3301,7 @@ class UtilitiesTab(QWidget):
         worker.finished.connect(self.on_edit_finished)
         worker.finished.connect(worker.deleteLater)
         self.edit_worker = worker
+        self._set_working_state(True, mode="download")
         worker.start()
         return True
 
@@ -2180,15 +3315,19 @@ class UtilitiesTab(QWidget):
 
         if success:
             self.progress_bar.setValue(100)
-            self.status_label.setText(f"Edits complete: {output_path}")
+            self.status_label.setText(tr("Edits complete: {path}").format(path=output_path))
             self.last_download_path = output_path
-            QMessageBox.information(self, "Editing Complete", f"Edited video saved to:\n{output_path}")
+            QMessageBox.information(
+                self,
+                tr("Editing Complete"),
+                tr("Edited video saved to:\n{path}").format(path=output_path),
+            )
             self._update_last_video_label()
         else:
             self.progress_bar.setValue(0)
-            error_text = message or "Video editing failed."
+            error_text = message or tr("Video editing failed.")
             self.status_label.setText(error_text)
-            QMessageBox.critical(self, "Editing Failed", error_text)
+            QMessageBox.critical(self, tr("Editing Failed"), error_text)
 
         self._set_working_state(False, mode="download")
 
@@ -2277,11 +3416,17 @@ class UtilitiesTab(QWidget):
     def on_worker_completed(self, mode: str, success: bool, message: str) -> None:
         worker = self.active_worker if self.active_mode == mode else None
         download_path = None
+        pending_edit = False
 
         if mode == "download" and worker is not None:
             download_path = getattr(worker, "last_downloaded_path", None)
             if download_path:
                 self.last_download_path = download_path
+            pending_edit = self._pending_edit_after_download
+            self._pending_edit_after_download = False
+        elif mode == "download":
+            pending_edit = self._pending_edit_after_download
+            self._pending_edit_after_download = False
 
         if mode == "download" and success:
             if not download_path and self.last_output_dir:
@@ -2291,7 +3436,7 @@ class UtilitiesTab(QWidget):
 
             self.progress_bar.setValue(100)
 
-            if self._any_edit_selected():
+            if pending_edit:
                 if download_path and Path(download_path).exists():
                     if self._start_edit_worker(download_path):
                         return
@@ -2303,7 +3448,7 @@ class UtilitiesTab(QWidget):
                     )
 
             self._set_working_state(False, mode=mode)
-            self.status_label.setText("Download completed successfully.")
+            self.status_label.setText(tr("Download completed successfully."))
             self._update_last_video_label()
             return
 
@@ -2332,11 +3477,18 @@ class UtilitiesTab(QWidget):
             self.fetch_btn.setEnabled(False)
             self.download_btn.setEnabled(False)
             self.formats_combo.setEnabled(False)
+            if self.download_only_btn:
+                self.download_only_btn.setEnabled(False)
+            if self.edit_last_btn:
+                self.edit_last_btn.setEnabled(False)
+            if self.edit_other_btn:
+                self.edit_other_btn.setEnabled(False)
         else:
             has_formats = bool(self.format_map)
             self.fetch_btn.setEnabled(True)
             self._update_format_controls(has_formats)
         self._update_upload_button_state()
+        self._update_edit_buttons_state()
 
     def _reset_state(self) -> None:
         self.current_formats = []
@@ -2347,6 +3499,7 @@ class UtilitiesTab(QWidget):
         self.video_title_label.setText("")
         self.progress_bar.setValue(0)
         self.status_label.setText("Ready")
+        self._update_edit_buttons_state()
 
     def _format_description(self, fmt: Dict[str, Any]) -> str:
         fmt_id = fmt.get("format_id", "?")
@@ -2366,9 +3519,9 @@ class UtilitiesTab(QWidget):
         filesize = fmt.get("filesize") or fmt.get("filesize_approx")
         if filesize:
             size_mb = filesize / (1024 * 1024)
-            size_text = f"{size_mb:.1f} MB"
+            size_text = f"({size_mb:.1f} MB)"
         else:
-            size_text = "Unknown size"
+            size_text = "(Unknown)"
 
         vcodec = fmt.get("vcodec", "")
         acodec = fmt.get("acodec", "")
@@ -2389,6 +3542,43 @@ class UtilitiesTab(QWidget):
             self.active_worker = None
             self.active_mode = None
 
+
+class ConsoleOutputRedirector:
+    """Redirects stdout/stderr to a QTextEdit widget"""
+    
+    def __init__(self, text_widget, original_stream):
+        self.text_widget = text_widget
+        self.original_stream = original_stream
+        
+    def write(self, text):
+        """Write text to both the widget and original stream"""
+        if text.strip():  # Only log non-empty lines
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            formatted_text = f"[{timestamp}] {text.strip()}"
+            
+            # Use direct append call (will be called from main thread)
+            try:
+                self.text_widget.append(formatted_text)
+                
+                # Auto-scroll to bottom
+                scrollbar = self.text_widget.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+            except Exception as e:
+                # If there's an error, just write to original stream
+                if self.original_stream:
+                    self.original_stream.write(f"Error logging to GUI: {e}\n")
+        
+        # Also write to original stream
+        if self.original_stream:
+            self.original_stream.write(text)
+    
+    def flush(self):
+        """Flush the stream"""
+        if self.original_stream:
+            self.original_stream.flush()
+
+
 class AutoBotGUI(QMainWindow):
     """Main GUI application window"""
     
@@ -2396,16 +3586,26 @@ class AutoBotGUI(QMainWindow):
         super().__init__()
         self.config_manager = ConfigManager()
         self.machine_key = get_machine_key()
+        self.stdout_redirector = None
+        self.stderr_redirector = None
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
         self.setup_ui()
         self.setup_menu()
         self.setup_status_bar()
         self._initialize_localization()
         self._setup_auto_updater()
+        self._setup_console_redirection()
         
     def setup_ui(self):
         """Setup the main UI"""
-        self.setWindowTitle("AutoBot GUI - YouTube to TikTok Bot")
+        self.setWindowTitle("Youtube - Tiktok Utililies")
         self.setGeometry(100, 100, 1400, 900)
+        
+        # Set application icon
+        icon_path = resource_path("resources", "icons", "icon_256.png")
+        if Path(icon_path).exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         
         # Central widget with tab widget
         central_widget = QWidget()
@@ -2524,22 +3724,207 @@ class AutoBotGUI(QMainWindow):
         """Initialize and start the auto-updater"""
         self.auto_updater = AutoUpdater(self)
         self.auto_updater.update_available.connect(self._on_update_available)
+        self.auto_updater.download_progress.connect(self._on_download_progress)
+        self.auto_updater.download_complete.connect(self._on_download_complete)
+        self.auto_updater.download_error.connect(self._on_download_error)
         self.auto_updater.start()
+        self.update_progress_dialog = None
+    
+    def _setup_console_redirection(self) -> None:
+        """Setup console output redirection to the log widget"""
+        # Find the settings tab and get the console log widget
+        if hasattr(self, 'settings_tab') and hasattr(self.settings_tab, 'console_log'):
+            self.stdout_redirector = ConsoleOutputRedirector(
+                self.settings_tab.console_log,
+                self.original_stdout
+            )
+            self.stderr_redirector = ConsoleOutputRedirector(
+                self.settings_tab.console_log,
+                self.original_stderr
+            )
+            sys.stdout = self.stdout_redirector
+            sys.stderr = self.stderr_redirector
+            
+            # Log initial message
+            print("Console logging initialized")
+    
+    def closeEvent(self, event):
+        """Handle window close event"""
+        # Restore original stdout/stderr
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+        event.accept()
     
     def _on_update_available(self, update_info: Dict[str, Any]) -> None:
         """Handle notification when an update is available"""
+        from auto_updater import UpdateNotificationDialog
+        
         dialog = UpdateNotificationDialog(update_info, self)
         result = dialog.exec()
         
         if result == QMessageBox.Yes:
-            # Open the download page in the default browser
-            import webbrowser
-            url = dialog.get_download_url()
-            if url:
-                webbrowser.open(url)
+            download_url = dialog.get_download_url()
+            
+            if download_url:
+                # Start automatic download
+                version = update_info.get('version', 'Unknown')
+                self.update_progress_dialog = UpdateDownloadDialog(version, self)
+                self.update_progress_dialog.show()
+                
+                # Start download in background
+                self.auto_updater.download_update(download_url, version)
+            else:
+                # Fallback to opening browser
+                import webbrowser
+                release_url = dialog.get_release_url()
+                if release_url:
+                    webbrowser.open(release_url)
         elif result == QMessageBox.Ignore:
             # User chose to ignore this update
             pass
+    
+    def _on_download_progress(self, current: int, total: int) -> None:
+        """Update download progress dialog"""
+        if self.update_progress_dialog:
+            self.update_progress_dialog.update_progress(current, total)
+    
+    def _on_download_complete(self, file_path: str) -> None:
+        """Handle successful download"""
+        if self.update_progress_dialog:
+            self.update_progress_dialog.close()
+            self.update_progress_dialog = None
+        
+        # Show success message with instructions
+        import platform
+        import subprocess
+        
+        system = platform.system()
+        file_path_obj = Path(file_path)
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle(tr("Update Downloaded"))
+        msg.setIcon(QMessageBox.Information)
+        
+        if system == "Darwin" and file_path_obj.suffix in ['.dmg', '.pkg']:
+            # macOS installer - manual installation required
+            msg.setText(tr("Update downloaded successfully!"))
+            msg.setInformativeText(
+                tr("The installer has been downloaded to:\n{path}\n\n"
+                   "Click 'Open' to launch the installer, or 'Show' to open the download folder.")
+                .format(path=file_path)
+            )
+            open_btn = msg.addButton(tr("Open"), QMessageBox.ActionRole)
+            show_btn = msg.addButton(tr("Show in Finder"), QMessageBox.ActionRole)
+            msg.addButton(QMessageBox.Close)
+            
+            msg.exec()
+            
+            if msg.clickedButton() == open_btn:
+                subprocess.Popen(['open', file_path])
+            elif msg.clickedButton() == show_btn:
+                subprocess.Popen(['open', '-R', file_path])
+                
+        elif system == "Windows" and file_path_obj.suffix in ['.exe', '.msi']:
+            # Windows installer - manual installation required
+            msg.setText(tr("Update downloaded successfully!"))
+            msg.setInformativeText(
+                tr("The installer has been downloaded to:\n{path}\n\n"
+                   "Click 'Run' to launch the installer now.")
+                .format(path=file_path)
+            )
+            run_btn = msg.addButton(tr("Run Installer"), QMessageBox.ActionRole)
+            show_btn = msg.addButton(tr("Show in Explorer"), QMessageBox.ActionRole)
+            msg.addButton(QMessageBox.Close)
+            
+            msg.exec()
+            
+            if msg.clickedButton() == run_btn:
+                subprocess.Popen([file_path])
+            elif msg.clickedButton() == show_btn:
+                subprocess.Popen(['explorer', '/select,', file_path])
+                
+        elif system == "Linux" and file_path_obj.suffix in ['.deb', '.rpm', '.appimage']:
+            # Linux installer - provide appropriate instructions
+            msg.setText(tr("Update downloaded successfully!"))
+            
+            if file_path_obj.suffix == '.deb':
+                instructions = tr("To install, run:\nsudo dpkg -i {path}\n\nOr double-click the file to open with package manager.")
+            elif file_path_obj.suffix == '.rpm':
+                instructions = tr("To install, run:\nsudo rpm -i {path}\n\nOr double-click the file to open with package manager.")
+            elif file_path_obj.suffix == '.appimage':
+                instructions = tr("To run, make executable and launch:\nchmod +x {path}\n{path}")
+            else:
+                instructions = tr("Please follow the installation instructions for your Linux distribution.")
+            
+            msg.setInformativeText(instructions.format(path=file_path))
+            open_btn = msg.addButton(tr("Open Folder"), QMessageBox.ActionRole)
+            msg.addButton(QMessageBox.Close)
+            
+            msg.exec()
+            
+            if msg.clickedButton() == open_btn:
+                subprocess.Popen(['xdg-open', str(file_path_obj.parent)])
+        else:
+            # Extracted archive - offer automatic installation
+            msg.setText(tr("Update downloaded and extracted successfully!"))
+            msg.setInformativeText(
+                tr("The application will now install the update and restart.\n\n"
+                   "Your current version will be backed up automatically.\n\n"
+                   "Click 'Install Now' to proceed, or 'Manual' to install manually.")
+            )
+            install_btn = msg.addButton(tr("Install Now"), QMessageBox.ActionRole)
+            manual_btn = msg.addButton(tr("Manual Installation"), QMessageBox.ActionRole)
+            cancel_btn = msg.addButton(QMessageBox.Cancel)
+            
+            result = msg.exec()
+            clicked = msg.clickedButton()
+            
+            if clicked == install_btn:
+                # Prepare and run update script
+                script_path = self.auto_updater.prepare_auto_update(file_path)
+                if script_path:
+                    # Show final message
+                    QMessageBox.information(
+                        self,
+                        tr("Installing Update"),
+                        tr("The application will now close and update automatically.\n\n"
+                           "Please wait a moment for the update to complete.")
+                    )
+                    
+                    # Launch update script
+                    if system == "Darwin" or system == "Linux":
+                        subprocess.Popen(['/bin/bash', script_path])
+                    elif system == "Windows":
+                        subprocess.Popen(['cmd', '/c', script_path], shell=True)
+                    
+                    # Close application to allow update
+                    QApplication.quit()
+                else:
+                    QMessageBox.warning(
+                        self,
+                        tr("Update Failed"),
+                        tr("Failed to prepare update script. Please install manually.")
+                    )
+            elif clicked == manual_btn:
+                # Open folder for manual installation
+                if system == "Darwin":
+                    subprocess.Popen(['open', file_path])
+                elif system == "Windows":
+                    subprocess.Popen(['explorer', file_path])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', file_path])
+    
+    def _on_download_error(self, error_message: str) -> None:
+        """Handle download error"""
+        if self.update_progress_dialog:
+            self.update_progress_dialog.close()
+            self.update_progress_dialog = None
+        
+        QMessageBox.critical(
+            self,
+            tr("Download Failed"),
+            tr("Failed to download update:\n{error}").format(error=error_message)
+        )
 
     def change_language(self, language_code: str) -> None:
         translator.set_language(language_code)
@@ -2799,6 +4184,11 @@ def main():
     app.setApplicationName("AutoBot GUI")
     app.setApplicationVersion("1.0")
     app.setOrganizationName("AutoBot")
+    
+    # Set application-wide icon
+    icon_path = resource_path("resources", "icons", "icon_256.png")
+    if Path(icon_path).exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     
     # Create and show main window
     window = AutoBotGUI()

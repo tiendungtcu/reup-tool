@@ -21,6 +21,13 @@ downloads/
 processed/
 dist/
 build/
-
+debug
+debug/
 # Node modules (if any)
 node_modules/
+
+# third party apps
+ffmpeg/
+chrome/
+aria2/
+node/

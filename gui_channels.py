@@ -232,7 +232,6 @@ class ChannelDialog(QDialog):
         self.is_editing = channel_id is not None
         self._updating_steps = False
         self._syncing_proxy_text = False
-        self.cookies_proxy_edit = None  # type: Optional[QLineEdit]
         self.pipeline_checks = {}  # type: Dict[str, QCheckBox]
         self.setup_ui()
         
@@ -309,10 +308,15 @@ class ChannelDialog(QDialog):
         self._prepare_line_edit(self.username_edit)
         layout.addRow(tr("TikTok Username:"), self.username_edit)
 
-        self.telegram_edit = QLineEdit()
-        self.telegram_edit.setPlaceholderText("chat_id|bot_token (optional)")
-        self._prepare_line_edit(self.telegram_edit)
-        layout.addRow(tr("Telegram Override:"), self.telegram_edit)
+        self.telegram_chat_id_edit = QLineEdit()
+        self.telegram_chat_id_edit.setPlaceholderText("6601226586 (optional)")
+        self._prepare_line_edit(self.telegram_chat_id_edit)
+        layout.addRow(tr("Telegram Chat ID Override:"), self.telegram_chat_id_edit)
+
+        self.telegram_bot_token_edit = QLineEdit()
+        self.telegram_bot_token_edit.setPlaceholderText("8295256760:AAF5xzq_Emngvp-g8SqhASJBLcvjJHvjr4Y (optional)")
+        self._prepare_line_edit(self.telegram_bot_token_edit)
+        layout.addRow(tr("Telegram Bot Token Override:"), self.telegram_bot_token_edit)
 
         widget.setLayout(layout)
         return widget
@@ -396,11 +400,19 @@ class ChannelDialog(QDialog):
         layout = QFormLayout()
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
+        proxy_layout = QHBoxLayout()
         self.proxy_edit = QLineEdit()
         self.proxy_edit.setPlaceholderText("host:port:username:password")
         self._prepare_line_edit(self.proxy_edit)
         self.proxy_edit.textChanged.connect(self._on_advanced_proxy_changed)
-        layout.addRow(tr("Proxy:"), self.proxy_edit)
+        proxy_layout.addWidget(self.proxy_edit)
+        
+        self.proxy_test_btn = QPushButton(tr("Test"))
+        self.proxy_test_btn.clicked.connect(self._test_proxy)
+        self.proxy_test_btn.setMaximumWidth(60)
+        proxy_layout.addWidget(self.proxy_test_btn)
+        
+        layout.addRow(tr("Proxy:"), proxy_layout)
 
         self.user_agent_edit = QLineEdit()
         self.user_agent_edit.setText("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -423,7 +435,7 @@ class ChannelDialog(QDialog):
         # Instructions
         instructions = QLabel(
             tr("Paste TikTok cookies in JSON format. You can export cookies from browser extensions.\n"
-            "The format should match the structure used by the application. Set an optional upload proxy below.")
+            "The format should match the structure used by the application.")
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -434,19 +446,6 @@ class ChannelDialog(QDialog):
         self._prepare_text_edit(self.cookies_edit)
         self.cookies_edit.textChanged.connect(self._on_cookies_text_changed)
         layout.addWidget(self.cookies_edit)
-
-        proxy_form = QFormLayout()
-        proxy_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-
-        self.cookies_proxy_edit = QLineEdit()
-        self.cookies_proxy_edit.setPlaceholderText("host:port or host:port:username:password")
-        self._prepare_line_edit(self.cookies_proxy_edit)
-        self.cookies_proxy_edit.textChanged.connect(self._on_cookies_proxy_changed)
-        proxy_form.addRow(tr("Upload Proxy:"), self.cookies_proxy_edit)
-        layout.addLayout(proxy_form)
-
-        # Align proxy field with current advanced tab value
-        self._set_proxy_text(self.proxy_edit.text())
 
         # Buttons for cookie management
         button_layout = QHBoxLayout()
@@ -515,7 +514,16 @@ class ChannelDialog(QDialog):
             self.channel_id_edit.setText(config.get('youtube_channel_id', ''))
             self.channel_name_edit.setText(config.get('channel_name', ''))
             self.username_edit.setText(config.get('username', ''))
-            self.telegram_edit.setText(config.get('telegram', ''))
+            
+            # Parse telegram setting (chat_id|bot_token)
+            telegram = config.get('telegram', '')
+            if telegram and '|' in telegram:
+                chat_id, bot_token = telegram.split('|', 1)
+                self.telegram_chat_id_edit.setText(chat_id.strip())
+                self.telegram_bot_token_edit.setText(bot_token.strip())
+            else:
+                self.telegram_chat_id_edit.setText('')
+                self.telegram_bot_token_edit.setText('')
             
             # YouTube settings
             self.api_key_edit.setPlainText(config.get('youtube_api_key', ''))
@@ -551,18 +559,19 @@ class ChannelDialog(QDialog):
     
     def get_channel_data(self):
         """Get channel data from UI"""
-        proxy_value = ""
-        if self.cookies_proxy_edit is not None:
-            proxy_value = self.cookies_proxy_edit.text().strip()
-        else:
-            proxy_value = self.proxy_edit.text().strip()
+        proxy_value = self.proxy_edit.text().strip()
         self._set_proxy_text(proxy_value)
+
+        # Combine chat_id and bot_token into telegram format
+        chat_id = self.telegram_chat_id_edit.text().strip()
+        bot_token = self.telegram_bot_token_edit.text().strip()
+        telegram = f"{chat_id}|{bot_token}" if chat_id and bot_token else ""
 
         config = {
             'youtube_channel_id': self.channel_id_edit.text().strip(),
             'channel_name': self.channel_name_edit.text().strip(),
             'username': self.username_edit.text().strip(),
-            'telegram': self.telegram_edit.text().strip(),
+            'telegram': telegram,
             'youtube_api_key': self.api_key_edit.toPlainText().strip(),
             'youtube_api_type': self.api_type_combo.currentText(),
             'api_scan_method': self.scan_method_combo.currentText(),
@@ -678,20 +687,13 @@ class ChannelDialog(QDialog):
             current_proxy = self.proxy_edit.text() if self.proxy_edit else ""
             if sanitized != current_proxy:
                 self.proxy_edit.setText(sanitized)
-            if self.cookies_proxy_edit is not None and sanitized != self.cookies_proxy_edit.text():
-                self.cookies_proxy_edit.setText(sanitized)
         finally:
             self._syncing_proxy_text = False
 
     def _on_advanced_proxy_changed(self, text: str):
         self._set_proxy_text(text)
 
-    def _on_cookies_proxy_changed(self, text: str):
-        self._set_proxy_text(text)
-
     def _on_cookies_text_changed(self):
-        if self.cookies_proxy_edit is None:
-            return
         text = self.cookies_edit.toPlainText().strip()
         if not text:
             return
@@ -722,6 +724,106 @@ class ChannelDialog(QDialog):
             if not username or not password:
                 return False
         return True
+    
+    def _test_proxy(self):
+        """Test if the proxy connection is working"""
+        proxy_text = self.proxy_edit.text().strip()
+        
+        if not proxy_text:
+            QMessageBox.warning(
+                self,
+                tr("No Proxy"),
+                tr("Please enter a proxy address to test."),
+            )
+            return
+        
+        if not self._is_valid_proxy_format(proxy_text):
+            QMessageBox.warning(
+                self,
+                tr("Invalid Format"),
+                tr("Proxy format should be host:port or host:port:username:password."),
+            )
+            return
+        
+        # Parse proxy
+        parts = proxy_text.split(":")
+        host = parts[0]
+        port = int(parts[1])
+        
+        proxy_dict = {
+            "http": f"http://{proxy_text}",
+            "https": f"http://{proxy_text}",
+        }
+        
+        if len(parts) == 4:
+            username, password = parts[2], parts[3]
+            proxy_dict = {
+                "http": f"http://{username}:{password}@{host}:{port}",
+                "https": f"http://{username}:{password}@{host}:{port}",
+            }
+        
+        # Create worker thread for testing
+        class ProxyTestWorker(QThread):
+            finished = Signal(bool, str)
+            
+            def __init__(self, proxy_dict):
+                super().__init__()
+                self.proxy_dict = proxy_dict
+            
+            def run(self):
+                try:
+                    import requests
+                    response = requests.get(
+                        "https://www.google.com",
+                        proxies=self.proxy_dict,
+                        timeout=10
+                    )
+                    self.finished.emit(True, tr("Proxy is working! Status code: {code}").format(code=response.status_code))
+                except Exception as e:
+                    self.finished.emit(False, tr("Proxy connection failed:\n{error}").format(error=str(e)))
+        
+        # Show testing dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("Testing Proxy"))
+        dialog.setModal(True)
+        dialog.resize(400, 150)
+        
+        layout = QVBoxLayout()
+        
+        status_label = QLabel(tr("Testing proxy connection...\nThis may take a few seconds."))
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+        
+        progress = QProgressBar()
+        progress.setRange(0, 0)  # Indeterminate progress
+        layout.addWidget(progress)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.button(QDialogButtonBox.Close).setEnabled(False)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        # Create and start worker
+        worker = ProxyTestWorker(proxy_dict)
+        
+        def on_test_finished(success, message):
+            status_label.setText(message)
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            button_box.button(QDialogButtonBox.Close).setEnabled(True)
+            
+            if success:
+                status_label.setStyleSheet("color: green;")
+            else:
+                status_label.setStyleSheet("color: red;")
+        
+        worker.finished.connect(on_test_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        
+        dialog.exec()
     
     def load_cookies_from_file(self):
         """Load cookies from JSON file"""
@@ -805,8 +907,8 @@ class ChannelDialog(QDialog):
         
         try:
             cookies = json.loads(cookies_text)
-            proxy_text = self.cookies_proxy_edit.text().strip() if self.cookies_proxy_edit else ""
-            if not proxy_text and isinstance(cookies, dict):
+            proxy_text = ""
+            if isinstance(cookies, dict):
                 proxy_text = str(cookies.get("proxy", "") or "").strip()
                 if proxy_text:
                     self._set_proxy_text(proxy_text)

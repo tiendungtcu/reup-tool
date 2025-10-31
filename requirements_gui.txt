@@ -14,7 +14,7 @@ Pillow>=11.0.0
 requests>=2.31.0
 
 # YouTube downloading
-yt-dlp>=2023.12.30
+yt-dlp>=2025.10.22
 
 # Telegram integration
 python-telegram-bot>=20.0

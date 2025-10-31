@@ -443,7 +443,7 @@ def download_video(channel, url, download_path):
             # Enhanced extractor args for speed
             "extractor_args": {
                 "youtube": {
-                    "skip": ["hls", "dash", "translated_subs"],
+                    "skip": ["translated_subs"],
                     "player_client": ["default"],
                     "player_skip": ["webpage", "initial_data"],
                     "webpage_skip": ["player_response", "initial_data"],
